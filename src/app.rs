@@ -34,9 +34,11 @@ pub struct KairoApp {
     
     // Keys
     common_key_path: Option<PathBuf>,
+    common_key_hex: String,
+    use_common_hex: bool,
     title_key_path: Option<PathBuf>,
     title_key_hex: String,
-    use_hex_key: bool,
+    use_title_hex: bool,
     
     // Options
     operation: Operation,
@@ -59,9 +61,11 @@ impl KairoApp {
             input_path: None,
             output_path: None,
             common_key_path: None,
+            common_key_hex: String::new(),
+            use_common_hex: false,
             title_key_path: None,
             title_key_hex: String::new(),
-            use_hex_key: false,
+            use_title_hex: false,
             operation: Operation::default(),
             verify_hashes: true,
             progress: Arc::new(Mutex::new(Progress::default())),
@@ -101,7 +105,7 @@ impl KairoApp {
         }
         
         // For extract, need keys
-        let has_common = self.common_key_path.is_some();
+        let has_common = self.common_key_path.is_some() || self.common_key_hex.len() == 32;
         let has_title = self.title_key_path.is_some() || self.title_key_hex.len() == 32;
         
         has_input && has_output && has_common && has_title
@@ -211,23 +215,36 @@ impl eframe::App for KairoApp {
             // Common key
             ui.horizontal(|ui| {
                 ui.label("Common:");
-                let status = if self.common_key_path.is_some() { "✅" } else { "❌" };
-                ui.label(status);
-                if let Some(path) = &self.common_key_path {
-                    ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                if self.use_common_hex {
+                    ui.add(egui::TextEdit::singleline(&mut self.common_key_hex)
+                        .hint_text("32 hex chars (e.g. D7B0...)")
+                        .desired_width(250.0));
+                    let valid = self.common_key_hex.len() == 32;
+                    ui.label(if valid { "✅" } else { "❌" });
+                } else {
+                    let status = if self.common_key_path.is_some() { "✅" } else { "❌" };
+                    ui.label(status);
+                    if let Some(path) = &self.common_key_path {
+                        ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                    }
+                    if ui.button("Browse").clicked() {
+                        self.common_key_path = self.pick_key_file();
+                    }
                 }
-                if ui.button("Browse").clicked() {
-                    self.common_key_path = self.pick_key_file();
+                if ui.button(if self.use_common_hex { "📄 File" } else { "🔢 Hex" }).clicked() {
+                    self.use_common_hex = !self.use_common_hex;
                 }
             });
             
             // Title key
             ui.horizontal(|ui| {
                 ui.label("Title:");
-                if self.use_hex_key {
+                if self.use_title_hex {
                     ui.add(egui::TextEdit::singleline(&mut self.title_key_hex)
-                        .hint_text("32 hex characters")
+                        .hint_text("32 hex chars")
                         .desired_width(250.0));
+                    let valid = self.title_key_hex.len() == 32;
+                    ui.label(if valid { "✅" } else { "❌" });
                 } else {
                     let status = if self.title_key_path.is_some() { "✅" } else { "❌" };
                     ui.label(status);
@@ -238,8 +255,8 @@ impl eframe::App for KairoApp {
                         self.title_key_path = self.pick_key_file();
                     }
                 }
-                if ui.button(if self.use_hex_key { "📄 File" } else { "🔢 Hex" }).clicked() {
-                    self.use_hex_key = !self.use_hex_key;
+                if ui.button(if self.use_title_hex { "📄 File" } else { "🔢 Hex" }).clicked() {
+                    self.use_title_hex = !self.use_title_hex;
                 }
             });
             
