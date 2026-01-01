@@ -148,19 +148,80 @@ impl KairoApp {
         }
         drop(status);
         
+        // Basic checks
         let has_input = self.input_path.is_some();
         let has_output = self.output_path.is_some();
         
+        if !has_input || !has_output {
+            return false;
+        }
+        
+        // Validation must pass
+        if self.validate_input().is_some() {
+            return false;
+        }
+        
         // For convert operation, no keys needed
         if self.operation == Operation::ConvertToWud {
-            return has_input && has_output;
+            return true;
         }
         
         // For extract, need keys
         let has_common = self.common_key_path.is_some() || self.common_key_hex.len() == 32;
         let has_title = self.title_key_path.is_some() || self.title_key_hex.len() == 32;
         
-        has_input && has_output && has_common && has_title
+        has_common && has_title
+    }
+    
+    /// Validate input file and return error message if invalid
+    fn validate_input(&self) -> Option<String> {
+        let input = self.input_path.as_ref()?;
+        
+        // Check file exists
+        if !input.exists() {
+            return Some(format!("File not found: {}", input.display()));
+        }
+        
+        // Check file size
+        if let Ok(metadata) = std::fs::metadata(input) {
+            if metadata.len() == 0 {
+                return Some("Input file is empty (0 bytes)".to_string());
+            }
+        } else {
+            return Some("Cannot read file metadata".to_string());
+        }
+        
+        // Check extension matches operation
+        let ext = input.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        
+        match self.operation {
+            Operation::ConvertToWud => {
+                if ext != "wux" {
+                    return Some(format!(
+                        "Wrong file type for WUX→WUD conversion!\nExpected: .wux\nGot: .{}\n\nDid you mean to use 'Extract WUD → WUP'?",
+                        ext
+                    ));
+                }
+            }
+            Operation::ExtractToWup => {
+                if ext != "wud" {
+                    if ext == "wux" {
+                        return Some(
+                            "Cannot extract .wux directly!\n\nFirst convert WUX→WUD, then extract.".to_string()
+                        );
+                    }
+                    return Some(format!(
+                        "Wrong file type for WUD→WUP extraction!\nExpected: .wud\nGot: .{}",
+                        ext
+                    ));
+                }
+            }
+        }
+        
+        None // All good!
     }
     
     fn start_operation(&self) {
@@ -409,7 +470,12 @@ impl eframe::App for KairoApp {
                 Status::Error(msg) => {
                     ui.colored_label(egui::Color32::RED, format!("❌ {}", msg));
                 }
-                Status::Idle => {}
+                Status::Idle => {
+                    // Show validation errors if any
+                    if let Some(error) = self.validate_input() {
+                        ui.colored_label(egui::Color32::from_rgb(255, 165, 0), format!("⚠️ {}", error));
+                    }
+                }
             }
             
             ui.add_space(10.0);

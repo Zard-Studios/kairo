@@ -65,6 +65,21 @@ impl FstEntry {
 pub fn extract_wud_to_wup(options: &ExtractOptions) -> Result<()> {
     report_progress(&options.progress, 0.0, "Opening WUD file...");
     
+    // Validate input file exists and has content
+    let metadata = std::fs::metadata(options.wud_path)
+        .map_err(|e| KairoError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Cannot access WUD file '{}': {}", options.wud_path.display(), e)
+        )))?;
+    
+    if metadata.len() == 0 {
+        return Err(KairoError::InvalidWud(format!(
+            "WUD file '{}' is empty (0 bytes)", options.wud_path.display()
+        )));
+    }
+    
+    eprintln!("Input file: {} ({:.2} GB)", options.wud_path.display(), metadata.len() as f64 / 1024.0 / 1024.0 / 1024.0);
+    
     // Open WUD file
     let mut reader = BufReader::new(File::open(options.wud_path)?);
     
