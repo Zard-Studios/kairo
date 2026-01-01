@@ -1,0 +1,30 @@
+[package]
+name = "kairo"
+version = "0.1.0"
+edition = "2021"
+authors = ["Zard Studios"]
+description = "Lightweight GUI tool for Wii U disc image processing"
+license = "MIT"
+repository = "https://github.com/federicofeduzi/kairo"
+keywords = ["wiiu", "wux", "wud", "wup", "nintendo"]
+categories = ["command-line-utilities", "cryptography"]
+
+[dependencies]
+# GUI
+eframe = "0.29"
+egui = "0.29"
+
+# Crypto
+aes = "0.8"
+cbc = "0.1"
+sha1 = "0.10"
+
+# Utils
+thiserror = "2.0"
+rfd = "0.15"          # Native file dialogs
+
+[profile.release]
+opt-level = "z"       # Optimize for size
+lto = true            # Link-time optimization
+codegen-units = 1     # Better optimization
+strip = true          # Strip symbols
