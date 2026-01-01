@@ -83,76 +83,178 @@ pub fn extract_wud_to_wup(options: &ExtractOptions) -> Result<()> {
     // Open WUD file
     let mut reader = BufReader::new(File::open(options.wud_path)?);
     
-    report_progress(&options.progress, 0.05, "Reading partition table...");
+    // Read disc header (first 64 bytes) for product code
+    let mut disc_header = [0u8; 64];
+    reader.read_exact(&mut disc_header)?;
     
-    // Read partition table from 0x18000 to find actual GM partition offset
-    // Pass common key to decrypt table entries
-    let table = crate::wud::PartitionTable::read(&mut reader, options.common_key)?;
+    report_progress(&options.progress, 0.05, "Decrypting partition table...");
     
-    // Try to find GM partition and extract FST
-    // Iterate over *all* partitions marked as GM, because standard lookup might fail
-    // and we might have multiple candidates in fallback
-    let gm_partitions: Vec<&Partition> = table.partitions.iter()
-        .filter(|p| p.partition_type == PartitionType::GM)
-        .collect();
+    // === JNUSLib-style decryption ===
+    // WIIU_DECRYPTED_AREA_OFFSET = 0x18000
+    const DECRYPTED_AREA_OFFSET: u64 = 0x18000;
+    const BLOCK_SIZE: usize = 0x10000; // 64KB blocks for decryption
+    const DECRYPTED_AREA_SIGNATURE: [u8; 4] = [0xCC, 0xA6, 0xE6, 0x7B];
+    
+    // Read one block (64KB) at the decrypted area offset
+    reader.seek(SeekFrom::Start(DECRYPTED_AREA_OFFSET))?;
+    let mut partition_toc_block = vec![0u8; BLOCK_SIZE];
+    reader.read_exact(&mut partition_toc_block)?;
+    
+    // Decrypt using disc key (title_key) with JNUSLib IV calculation
+    // IV = (file_offset >> 16) at position 0x08
+    crate::wud::decrypt::decrypt_chunk(&mut partition_toc_block, options.title_key, DECRYPTED_AREA_OFFSET);
+    
+    eprintln!("Decrypted TOC signature: {:02X?}", &partition_toc_block[0..4]);
+    
+    // Verify signature
+    if partition_toc_block[0..4] != DECRYPTED_AREA_SIGNATURE {
+        eprintln!("⚠️ TOC signature mismatch! Expected {:02X?}, got {:02X?}", 
+                  DECRYPTED_AREA_SIGNATURE, &partition_toc_block[0..4]);
         
-    eprintln!("Found {} candidate GM partitions to check", gm_partitions.len());
-
-    let mut fst_content = Vec::new();
-    let mut active_partition = None;
-    
-    // Read the first 0x400 bytes of the WUD for potential Title ID extraction
-    let current_pos = reader.stream_position()?;
-    reader.seek(SeekFrom::Start(0))?;
-    let mut header = [0u8; 0x400];
-    reader.read_exact(&mut header)?;
-    reader.seek(SeekFrom::Start(current_pos))?; // Restore position
-
-    for (i, partition_info) in gm_partitions.iter().enumerate() {
-        eprintln!("Checking Candidate Partition #{}: Offset 0x{:X}", i, partition_info.offset);
-        
-        let mut key_to_use = options.title_key;
-        if let Some(pkey) = partition_info.title_key.as_ref() {
-             eprintln!("  (Using partition-specific Title Key)");
-             key_to_use = pkey;
+        // Try with database key if available
+        if let Some(product_code) = crate::disc_keys::extract_product_code(&disc_header) {
+            if let Some(key_hex) = crate::disc_keys::lookup_disc_key(&product_code) {
+                if let Some(db_key) = crate::disc_keys::parse_hex_key(key_hex) {
+                    eprintln!("🔑 Trying database key for {}", product_code);
+                    
+                    // Re-read and try with database key
+                    reader.seek(SeekFrom::Start(DECRYPTED_AREA_OFFSET))?;
+                    reader.read_exact(&mut partition_toc_block)?;
+                    crate::wud::decrypt::decrypt_chunk(&mut partition_toc_block, &db_key, DECRYPTED_AREA_OFFSET);
+                    
+                    eprintln!("Database key decrypted TOC signature: {:02X?}", &partition_toc_block[0..4]);
+                    
+                    if partition_toc_block[0..4] != DECRYPTED_AREA_SIGNATURE {
+                        return Err(KairoError::InvalidWud(
+                            "Failed to decrypt partition table - wrong disc key?".to_string()
+                        ));
+                    }
+                    eprintln!("✅ Database key worked!");
+                }
+            }
+        } else {
+            return Err(KairoError::InvalidWud(
+                "Failed to decrypt partition table - wrong disc key?".to_string()
+            ));
         }
-
-        // Try to find/extract FST from this partition
-        match find_and_extract_fst(
-            &mut reader, 
-            partition_info.offset, 
-            key_to_use,
-            Some(options.common_key), // Pass common key for decryption attempts
-            &header
-        ) {
-            Ok(fst) if !fst.is_empty() => {
-                fst_content = fst;
-                active_partition = Some(*partition_info);
-                eprintln!("Valid FST found in partition at 0x{:X}!", partition_info.offset);
-                break;
-            }
-            Ok(_) => {
-                eprintln!("  No FST found in this partition (decryption valid but magic missing?)");
-            }
-            Err(e) => {
-                eprintln!("  Error checking partition: {:?}", e);
-            }
-        }
-    }
-
-    if fst_content.is_empty() {
-        return Err(KairoError::InvalidWud("Could not find FST in disc image (checked all candidates)".to_string()));
+    } else {
+        eprintln!("✅ TOC signature verified!");
     }
     
-    let partition_info = active_partition.unwrap(); // access the reference
-
-    let gm_offset = partition_info.offset;
-    let gm_size = partition_info.size;
+    // Parse partition count from TOC (offset 0x1C, big-endian u32)
+    let partition_count = u32::from_be_bytes([
+        partition_toc_block[0x1C], partition_toc_block[0x1D],
+        partition_toc_block[0x1E], partition_toc_block[0x1F]
+    ]) as usize;
     
-    report_progress(&options.progress, 0.1, &format!(
-        "Found GM partition at offset 0x{:X}, size {} MB", 
-        gm_offset, 
-        gm_size / 1_000_000
+    eprintln!("Found {} partitions in TOC", partition_count);
+    
+    // Parse partition entries from TOC (starting at offset 0x800)
+    const PARTITION_TOC_OFFSET: usize = 0x800;
+    const PARTITION_TOC_ENTRY_SIZE: usize = 0x80;
+    
+    let mut gm_partition_offset: Option<u64> = None;
+    
+    for i in 0..partition_count {
+        let entry_offset = PARTITION_TOC_OFFSET + (i * PARTITION_TOC_ENTRY_SIZE);
+        if entry_offset + PARTITION_TOC_ENTRY_SIZE > partition_toc_block.len() {
+            break;
+        }
+        
+        // Read partition name (null-terminated string at start of entry)
+        let name_bytes = &partition_toc_block[entry_offset..entry_offset + 0x19];
+        let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(name_bytes.len());
+        let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_string();
+        
+        // Read partition offset (at entry + 0x20, as sector count)
+        let offset_in_sectors = u32::from_be_bytes([
+            partition_toc_block[entry_offset + 0x20],
+            partition_toc_block[entry_offset + 0x21],
+            partition_toc_block[entry_offset + 0x22],
+            partition_toc_block[entry_offset + 0x23],
+        ]) as u64;
+        
+        let partition_offset_abs = offset_in_sectors * SECTOR_SIZE as u64;
+        
+        eprintln!("  Partition {}: '{}' at offset 0x{:X}", i, name, partition_offset_abs);
+        
+        // Look for GM partition (game content)
+        if name.starts_with("GM") && gm_partition_offset.is_none() {
+            gm_partition_offset = Some(partition_offset_abs);
+        }
+    }
+    
+    let gm_offset = gm_partition_offset.ok_or_else(|| 
+        KairoError::InvalidWud("No GM partition found in TOC".to_string())
+    )?;
+    
+    eprintln!("🎮 Using GM partition at offset 0x{:X}", gm_offset);
+    
+    // Now read FST from GM partition
+    // The partition starts with a header, followed by the FST
+    report_progress(&options.progress, 0.1, "Reading FST from GM partition...");
+    
+    // Read partition header (first 0x20 bytes)
+    const PARTITION_START_SIGNATURE: [u8; 4] = [0xCC, 0x93, 0xA4, 0xF5];
+    
+    reader.seek(SeekFrom::Start(gm_offset))?;
+    let mut partition_header_raw = vec![0u8; 0x20];
+    reader.read_exact(&mut partition_header_raw)?;
+    
+    // Decrypt partition header
+    crate::wud::decrypt::decrypt_chunk(&mut partition_header_raw, options.title_key, gm_offset);
+    
+    eprintln!("Partition header signature: {:02X?}", &partition_header_raw[0..4]);
+    
+    if partition_header_raw[0..4] != PARTITION_START_SIGNATURE {
+        return Err(KairoError::InvalidWud(
+            format!("Invalid partition header signature at 0x{:X}", gm_offset)
+        ));
+    }
+    
+    eprintln!("✅ Partition header verified!");
+    
+    // Read header size (offset 0x04)
+    let header_size = u32::from_be_bytes([
+        partition_header_raw[0x04], partition_header_raw[0x05],
+        partition_header_raw[0x06], partition_header_raw[0x07]
+    ]) as u64;
+    
+    // Read FST size (offset 0x14)
+    let fst_size = u32::from_be_bytes([
+        partition_header_raw[0x14], partition_header_raw[0x15],
+        partition_header_raw[0x16], partition_header_raw[0x17]
+    ]) as u64;
+    
+    eprintln!("Partition header size: 0x{:X}", header_size);
+    eprintln!("FST size: 0x{:X} ({} KB)", fst_size, fst_size / 1024);
+    
+    // FST is located at partition_offset + header_size
+    let fst_offset = gm_offset + header_size;
+    
+    reader.seek(SeekFrom::Start(fst_offset))?;
+    let mut fst_content = vec![0u8; fst_size as usize];
+    reader.read_exact(&mut fst_content)?;
+    
+    // Decrypt FST
+    crate::wud::decrypt::decrypt_chunk(&mut fst_content, options.title_key, fst_offset);
+    
+    // Verify FST magic ("FST\0")
+    const FST_SIGNATURE: [u8; 4] = [0x46, 0x53, 0x54, 0x00];
+    eprintln!("FST header: {:02X?}", &fst_content[0..4]);
+    
+    if fst_content[0..4] != FST_SIGNATURE {
+        return Err(KairoError::InvalidWud(
+            "Invalid FST signature - decryption failed?".to_string()
+        ));
+    }
+    
+    
+    eprintln!("✅ FST decrypted and verified! Size: {} bytes", fst_content.len());
+    
+    report_progress(&options.progress, 0.15, &format!(
+        "GM partition at offset 0x{:X}, FST parsed", 
+        gm_offset
     ));
     
     report_progress(&options.progress, 0.2, "Parsing FST...");
@@ -190,7 +292,7 @@ fn find_and_extract_fst<R: Read + Seek>(
     partition_offset: u64,
     key: &[u8; 16],
     common_key: Option<&[u8; 16]>,
-    _disc_header: &[u8]
+    disc_header: &[u8]
 ) -> Result<Vec<u8>> {
     eprintln!("Searching for FST in partition at 0x{:X}...", partition_offset);
     
@@ -317,6 +419,32 @@ fn find_and_extract_fst<R: Read + Seek>(
             }
         } else {
             eprintln!("Could not find Title ID - cannot decrypt Title Key properly.");
+        }
+    }
+    
+    // 3. Try known disc key from our database!
+    // Read product code from header
+    if disc_header.len() >= 10 {
+        let header_str = String::from_utf8_lossy(&disc_header[0..10]);
+        
+        // Extract 4-char product code (e.g., "ANXP" from "WUP-P-ANXP")
+        if header_str.starts_with("WUP-P-") && disc_header.len() >= 10 {
+            let product_code = String::from_utf8_lossy(&disc_header[6..10]).to_string();
+            
+            if let Some(known_key_hex) = crate::disc_keys::lookup_disc_key(&product_code) {
+                if let Some(known_key) = crate::disc_keys::parse_hex_key(known_key_hex) {
+                    let game_name = crate::disc_keys::get_game_name(&product_code).unwrap_or("Unknown");
+                    let region = crate::disc_keys::get_region(&product_code);
+                    
+                    eprintln!("🔑 Trying known disc key for {} [{}]", game_name, region);
+                    eprintln!("   Key: {}", known_key_hex);
+                    
+                    if let Some(fst) = try_key(&known_key, "Database") {
+                        eprintln!("✅ Found FST using database key!");
+                        return Ok(fst);
+                    }
+                }
+            }
         }
     }
     

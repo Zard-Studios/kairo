@@ -79,14 +79,27 @@ pub fn decrypt_partition<P: AsRef<Path>>(
 /// Decrypt a buffer using AES-128-CBC
 /// 
 /// Helpful for decrypting headers or small structures.
+/// IMPORTANT: This properly chains CBC mode - each block uses previous ciphertext as IV
 pub fn decrypt_buffer(data: &mut [u8], key: &Key, iv: &[u8; 16]) {
-    let decryptor = Aes128CbcDec::new(key.into(), iv.into());
+    use cbc::cipher::generic_array::GenericArray;
+    
+    let mut decryptor = Aes128CbcDec::new(key.into(), iv.into());
     
     let block_count = data.len() / BLOCK_SIZE;
     for i in 0..block_count {
         let start = i * BLOCK_SIZE;
         let end = start + BLOCK_SIZE;
-        let block = &mut data[start..end];
-        decryptor.clone().decrypt_block_mut(block.into());
+        let block: &mut GenericArray<u8, _> = GenericArray::from_mut_slice(&mut data[start..end]);
+        decryptor.decrypt_block_mut(block);
     }
+}
+
+/// Decrypt a chunk using JNUSLib-style IV calculation
+/// 
+/// IV = 16-byte buffer with (file_offset >> 16) at position 0x08
+pub fn decrypt_chunk(data: &mut [u8], key: &Key, file_offset: u64) {
+    let mut iv = [0u8; 16];
+    let iv_value = file_offset >> 16;
+    iv[8..16].copy_from_slice(&iv_value.to_be_bytes());
+    decrypt_buffer(data, key, &iv);
 }
