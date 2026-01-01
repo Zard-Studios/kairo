@@ -193,28 +193,38 @@ fn find_and_extract_fst<R: Read + Seek>(
     
     // 2. Try decrypting the provided key (assuming it's an Encrypted Title Key)
     if let Some(comm_key) = common_key {
-        // We need the Title ID to decrypt the key. 
-        // Typically at 0x18C, but dump showed zeros.
-        // Let's scan the first sector for a Title ID pattern (starts with 00 05 00 ...)
         let mut title_id = [0u8; 8];
         let mut found_tid = false;
         
-        // Check 0x18C first
-        if disc_header[0x18C] == 0x00 && disc_header[0x18D] == 0x05 {
-             title_id.copy_from_slice(&disc_header[0x18C..0x194]);
-             found_tid = true;
-        } else {
-            // Scan
-            for i in (0..0x400).step_by(4) {
-                if disc_header[i] == 0x00 && disc_header[i+1] == 0x05 && disc_header[i+2] == 0x00 {
-                    // Possible Title ID
-                    title_id.copy_from_slice(&disc_header[i..i+8]);
+        // Strategy A: Scan for Ticket/TitleID in first 64KB
+        let mut large_header = vec![0u8; 0x10000]; // 64KB
+        reader.seek(SeekFrom::Start(0))?;
+        if reader.read_exact(&mut large_header).is_ok() {
+             for i in (0..large_header.len()-8).step_by(4) {
+                // Title IDs usually start with 00 05 00 ...
+                if large_header[i] == 0x00 && large_header[i+1] == 0x05 && large_header[i+2] == 0x00 {
+                    title_id.copy_from_slice(&large_header[i..i+8]);
                     eprintln!("Found potential Title ID at 0x{:X}: {:02X?}", i, title_id);
                     found_tid = true;
                     break;
                 }
             }
         }
+        
+        // Strategy B: Fallback using Game ID (Product Code)
+        if !found_tid {
+             let game_id_str = String::from_utf8_lossy(&large_header[0..10]);
+             eprintln!("Game ID from header: {}", game_id_str);
+             
+             // Known Game ID map (expand as needed or fetch online?)
+             if game_id_str.contains("ANXP") { // Wii Party U (EUR)
+                 eprintln!("Detected Wii Party U (EUR) - Using known Title ID");
+                 title_id = [0x00, 0x05, 0x00, 0x00, 0x10, 0x14, 0x5C, 0x00];
+                 found_tid = true;
+             }
+        }
+        
+        reader.seek(SeekFrom::Start(partition_offset))?;
         
         if found_tid {
             let mut decrypted_title_key = *key;
@@ -231,7 +241,7 @@ fn find_and_extract_fst<R: Read + Seek>(
                 return Ok(fst);
             }
         } else {
-            eprintln!("Could not find Title ID in header - cannot decrypt Title Key properly.");
+            eprintln!("Could not find Title ID - cannot decrypt Title Key properly.");
         }
     }
     
