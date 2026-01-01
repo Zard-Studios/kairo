@@ -4,4 +4,4 @@
 
 mod extract;
 
-pub use extract::extract_to_wup;
+pub use extract::{extract_wud_to_wup, ExtractOptions, ProgressCallback};

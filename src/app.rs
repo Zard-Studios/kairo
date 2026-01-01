@@ -117,6 +117,10 @@ impl KairoApp {
         let progress = Arc::clone(&self.progress);
         let status = Arc::clone(&self.status);
         
+        // Clone keys for the thread
+        let common_key_hex = self.common_key_hex.clone();
+        let title_key_hex = self.title_key_hex.clone();
+        
         // Set running status
         {
             let mut s = status.lock().unwrap();
@@ -162,11 +166,37 @@ impl KairoApp {
                 }
                 Operation::ExtractToWup => {
                     // WUD -> WUP extraction
-                    // TODO: Implement full extraction
-                    let mut p = progress.lock().unwrap();
-                    p.percent = 1.0;
-                    p.message = "WUP extraction not yet implemented".to_string();
-                    Ok(())
+                    // Parse keys from hex or load from files
+                    let common_key = parse_hex_key(&common_key_hex);
+                    let title_key = parse_hex_key(&title_key_hex);
+                    
+                    match (common_key, title_key) {
+                        (Some(ck), Some(tk)) => {
+                            let progress_clone = Arc::clone(&progress);
+                            let progress_cb: crate::wup::ProgressCallback = Arc::new(Mutex::new(
+                                move |percent: f32, msg: &str| {
+                                    let mut p = progress_clone.lock().unwrap();
+                                    p.percent = percent;
+                                    p.message = msg.to_string();
+                                }
+                            ));
+                            
+                            let options = crate::wup::ExtractOptions {
+                                wud_path: &input,
+                                output_dir: &output,
+                                common_key: &ck,
+                                title_key: &tk,
+                                progress: Some(progress_cb),
+                            };
+                            
+                            crate::wup::extract_wud_to_wup(&options)
+                        }
+                        _ => {
+                            Err(crate::error::KairoError::InvalidKey(
+                                "Invalid key format".to_string()
+                            ))
+                        }
+                    }
                 }
             };
             
@@ -183,6 +213,20 @@ impl KairoApp {
         let status = self.status.lock().unwrap();
         *status == Status::Running
     }
+}
+
+/// Parse a 32-character hex string into a 16-byte key
+fn parse_hex_key(hex: &str) -> Option<[u8; 16]> {
+    if hex.len() != 32 {
+        return None;
+    }
+    
+    let mut key = [0u8; 16];
+    for i in 0..16 {
+        let byte_str = &hex[i * 2..i * 2 + 2];
+        key[i] = u8::from_str_radix(byte_str, 16).ok()?;
+    }
+    Some(key)
 }
 
 impl eframe::App for KairoApp {
