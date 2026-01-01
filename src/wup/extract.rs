@@ -132,69 +132,107 @@ pub fn extract_wud_to_wup(options: &ExtractOptions) -> Result<()> {
     Ok(())
 }
 
-/// Find FST by scanning decrypted sectors
+/// Find FST by reading partition header
 fn find_and_extract_fst<R: Read + Seek>(
     reader: &mut BufReader<R>,
     key: &[u8; 16],
     partition_offset: u64,
 ) -> Result<Vec<u8>> {
-    // Scan first 16MB for FST magic
-    const SCAN_SIZE: u64 = 16 * 1024 * 1024;
-    const SECTOR_SIZE_U64: u64 = SECTOR_SIZE as u64;
+    // Read and decrypt first few sectors to find FST location
+    // The FST offset is typically at 0x424 in the partition header (like Wii)
     
-    let mut sector_buf = vec![0u8; SECTOR_SIZE];
+    let mut header_data = vec![0u8; SECTOR_SIZE * 4]; // Read 4 sectors (128KB)
+    reader.seek(SeekFrom::Start(partition_offset))?;
+    reader.read_exact(&mut header_data)?;
     
-    for sector_idx in 0..(SCAN_SIZE / SECTOR_SIZE_U64) {
-        let offset = partition_offset + sector_idx * SECTOR_SIZE_U64;
-        reader.seek(SeekFrom::Start(offset))?;
-        
-        if reader.read_exact(&mut sector_buf).is_err() {
-            break;
-        }
-        
-        // Decrypt sector
+    // Decrypt the header data
+    for sector_idx in 0..4 {
+        let start = sector_idx * SECTOR_SIZE;
+        let end = start + SECTOR_SIZE;
         let mut iv = [0u8; 16];
-        iv[..8].copy_from_slice(&sector_idx.to_be_bytes());
-        decrypt_sector(&mut sector_buf, key, &iv);
+        iv[..8].copy_from_slice(&(sector_idx as u64).to_be_bytes());
+        decrypt_sector(&mut header_data[start..end], key, &iv);
+    }
+    
+    // Try to find FST magic directly in decrypted data
+    for i in 0..(header_data.len() - 32) {
+        let magic = u32::from_be_bytes([
+            header_data[i], header_data[i+1], header_data[i+2], header_data[i+3]
+        ]);
         
-        // Search for FST magic in this sector
-        for i in 0..(SECTOR_SIZE - 4) {
-            let magic = u32::from_be_bytes([
-                sector_buf[i], sector_buf[i+1], sector_buf[i+2], sector_buf[i+3]
-            ]);
-            if magic == FST_MAGIC {
-                // Found FST! Read the full FST
-                // FST size is at offset +8 from magic
-                if i + 12 < SECTOR_SIZE {
-                    let fst_size = u32::from_be_bytes([
-                        sector_buf[i+8], sector_buf[i+9], sector_buf[i+10], sector_buf[i+11]
+        if magic == FST_MAGIC {
+            // Found FST! Get size from offset +8
+            if i + 32 <= header_data.len() {
+                // Try to read FST size (entry count is at offset 8, each entry is 0x10 bytes)
+                let entry_count = u32::from_be_bytes([
+                    header_data[i+8], header_data[i+9], header_data[i+10], header_data[i+11]
+                ]) as usize;
+                
+                if entry_count > 0 && entry_count < 100_000 {
+                    let fst_size = 0x20 + entry_count * 0x10 + 0x10000; // Header + entries + nametable est.
+                    let fst_start = i;
+                    let fst_end = std::cmp::min(fst_start + fst_size, header_data.len());
+                    return Ok(header_data[fst_start..fst_end].to_vec());
+                }
+            }
+        }
+    }
+    
+    // Fallback: Try reading FST offset from 0x424 (Wii-style)
+    if header_data.len() > 0x428 {
+        let fst_offset_raw = u32::from_be_bytes([
+            header_data[0x424], header_data[0x425], header_data[0x426], header_data[0x427]
+        ]);
+        let fst_offset = (fst_offset_raw as u64) * 4; // Multiply by 4 per Wii format
+        
+        if fst_offset > 0 && fst_offset < 64 * 1024 * 1024 {
+            // Read FST from this offset
+            let abs_offset = partition_offset + fst_offset;
+            reader.seek(SeekFrom::Start(abs_offset))?;
+            
+            // Read enough for FST header
+            let mut fst_header = [0u8; 32];
+            if reader.read_exact(&mut fst_header).is_ok() {
+                // Decrypt
+                let sector_idx = fst_offset / SECTOR_SIZE as u64;
+                let mut iv = [0u8; 16];
+                iv[..8].copy_from_slice(&sector_idx.to_be_bytes());
+                decrypt_sector(&mut fst_header, key, &iv);
+                
+                let magic = u32::from_be_bytes([fst_header[0], fst_header[1], fst_header[2], fst_header[3]]);
+                if magic == FST_MAGIC {
+                    // Read full FST
+                    let entry_count = u32::from_be_bytes([
+                        fst_header[8], fst_header[9], fst_header[10], fst_header[11]
                     ]) as usize;
                     
-                    if fst_size > 0 && fst_size < 64 * 1024 * 1024 {
-                        return read_fst_data(reader, key, partition_offset, 
-                            sector_idx * SECTOR_SIZE_U64 + i as u64, fst_size);
+                    if entry_count > 0 && entry_count < 100_000 {
+                        let fst_size = 0x20 + entry_count * 0x10 + 0x10000;
+                        reader.seek(SeekFrom::Start(abs_offset))?;
+                        let mut fst_data = vec![0u8; fst_size];
+                        let _ = reader.read(&mut fst_data);
+                        
+                        // Decrypt all FST sectors
+                        let num_sectors = (fst_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
+                        for s in 0..num_sectors {
+                            let start = s * SECTOR_SIZE;
+                            let end = std::cmp::min(start + SECTOR_SIZE, fst_data.len());
+                            let mut iv = [0u8; 16];
+                            iv[..8].copy_from_slice(&(sector_idx + s as u64).to_be_bytes());
+                            decrypt_sector(&mut fst_data[start..end], key, &iv);
+                        }
+                        
+                        return Ok(fst_data);
                     }
                 }
             }
         }
     }
     
-    // If we couldn't find FST, return empty - we'll fall back to raw extraction
     Ok(Vec::new())
 }
 
-/// Read full FST data from disc
-fn read_fst_data<R: Read + Seek>(
-    _reader: &mut BufReader<R>,
-    _key: &[u8; 16],
-    _partition_offset: u64,
-    _fst_offset: u64,
-    _fst_size: usize,
-) -> Result<Vec<u8>> {
-    // For now, return empty to trigger fallback
-    // Full implementation would read and decrypt the entire FST
-    Ok(Vec::new())
-}
+
 
 /// Parse FST data into entries and name table
 fn parse_fst(data: &[u8]) -> Result<(Vec<FstEntry>, Vec<u8>)> {
