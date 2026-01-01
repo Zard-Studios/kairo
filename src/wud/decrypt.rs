@@ -75,3 +75,18 @@ pub fn decrypt_partition<P: AsRef<Path>>(
     writer.flush()?;
     Ok(())
 }
+
+/// Decrypt a buffer using AES-128-CBC
+/// 
+/// Helpful for decrypting headers or small structures.
+pub fn decrypt_buffer(data: &mut [u8], key: &Key, iv: &[u8; 16]) {
+    let decryptor = Aes128CbcDec::new(key.into(), iv.into());
+    
+    let block_count = data.len() / BLOCK_SIZE;
+    for i in 0..block_count {
+        let start = i * BLOCK_SIZE;
+        let end = start + BLOCK_SIZE;
+        let block = &mut data[start..end];
+        decryptor.clone().decrypt_block_mut(block.into());
+    }
+}

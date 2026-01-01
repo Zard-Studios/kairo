@@ -50,10 +50,14 @@ impl PartitionTable {
     /// 
     /// The partition table is located at a fixed offset and contains
     /// entries describing each partition's type, offset, and size.
+    /// Parse partition table from WUD file
+    /// 
+    /// The partition table is located at a fixed offset and contains
+    /// entries describing each partition's type, offset, and size.
     /// Note: The partition table in retail WUD discs may be encrypted.
-    pub fn read<R: Read + Seek>(reader: &mut R) -> Result<Self> {
+    pub fn read<R: Read + Seek>(reader: &mut R, common_key: &[u8; 16]) -> Result<Self> {
         // First try offset 0x18000 (standard location)
-        let result = Self::try_read_at(reader, 0x18000);
+        let result = Self::try_read_at(reader, 0x18000, common_key);
         if let Ok(table) = result {
             if !table.partitions.is_empty() {
                 return Ok(table);
@@ -77,7 +81,11 @@ impl PartitionTable {
         Ok(Self { partitions })
     }
     
-    fn try_read_at<R: Read + Seek>(reader: &mut R, table_offset: u64) -> Result<Self> {
+    fn try_read_at<R: Read + Seek>(
+        reader: &mut R, 
+        table_offset: u64, 
+        common_key: &[u8; 16]
+    ) -> Result<Self> {
         reader.seek(SeekFrom::Start(table_offset))?;
         
         let mut partitions = Vec::new();
@@ -87,8 +95,13 @@ impl PartitionTable {
             let mut entry = [0u8; 32];
             reader.read_exact(&mut entry)?;
             
-            // Debug: print raw bytes
-            eprintln!("Partition {} at 0x{:X} raw: {:02X?}", i, table_offset, &entry[..8]);
+            // Decrypt the entry using Common Key
+            // IV is typically 0 for the partition table
+            let iv = [0u8; 16]; 
+            crate::wud::decrypt::decrypt_buffer(&mut entry, common_key, &iv);
+            
+            // Debug: print decrypted bytes
+            eprintln!("Partition {} decrypted (IV=0): {:02X?}", i, &entry[..8]);
             
             let type_id = u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]);
             
@@ -98,7 +111,7 @@ impl PartitionTable {
                 0x5550 => PartitionType::UP,
                 0x4749 => PartitionType::GI,
                 0x474D => PartitionType::GM,
-                _ => continue, // Skip invalid/encrypted entries
+                _ => continue, // Skip invalid entries
             };
             
             let offset = u64::from_be_bytes([

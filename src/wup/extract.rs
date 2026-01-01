@@ -70,7 +70,8 @@ pub fn extract_wud_to_wup(options: &ExtractOptions) -> Result<()> {
     report_progress(&options.progress, 0.05, "Reading partition table...");
     
     // Read partition table from 0x18000 to find actual GM partition offset
-    let partition_table = crate::wud::PartitionTable::read(&mut reader)?;
+    // Pass common key to decrypt table entries
+    let partition_table = crate::wud::PartitionTable::read(&mut reader, options.common_key)?;
     
     // Find GM partition
     let gm_partition = partition_table.game_partition()
