@@ -66,38 +66,27 @@ pub fn extract_wud_to_wup(options: &ExtractOptions) -> Result<()> {
     
     // Open WUD file
     let mut reader = BufReader::new(File::open(options.wud_path)?);
-    let file_size = reader.get_ref().metadata()?.len();
     
-    report_progress(&options.progress, 0.05, "Reading partition info...");
+    report_progress(&options.progress, 0.05, "Reading partition table...");
     
-    // GM partition typically starts at 0x10000000 (256MB offset)
-    // But we need to find the actual offset from the partition table
-    const GM_PARTITION_OFFSET: u64 = 0x10000000;
+    // Read partition table from 0x18000 to find actual GM partition offset
+    let partition_table = crate::wud::PartitionTable::read(&mut reader)?;
     
-    // For disc-based games, the FST is at a specific location within the GM partition
-    // The FST location can be found in the disc header
-    // Let's read the disc header first to find FST offset
+    // Find GM partition
+    let gm_partition = partition_table.game_partition()
+        .ok_or_else(|| KairoError::InvalidWud("No GM partition found".into()))?;
     
-    reader.seek(SeekFrom::Start(GM_PARTITION_OFFSET))?;
+    let gm_offset = gm_partition.offset;
+    let gm_size = gm_partition.size;
     
-    // Read first sector and decrypt it to find FST location
-    let mut header_sector = vec![0u8; SECTOR_SIZE];
-    reader.read_exact(&mut header_sector)?;
+    report_progress(&options.progress, 0.1, &format!(
+        "Found GM partition at offset 0x{:X}, size {} MB", 
+        gm_offset, 
+        gm_size / 1_000_000
+    ));
     
-    // Decrypt the header sector
-    let mut iv = [0u8; 16];
-    iv[..8].copy_from_slice(&0u64.to_be_bytes());
-    decrypt_sector(&mut header_sector, options.title_key, &iv);
-    
-    // Look for FST in the decrypted header
-    // The FST offset is typically stored at offset 0x424 (relative to partition start)
-    // Or we search for the FST magic
-    
-    report_progress(&options.progress, 0.1, "Searching for FST...");
-    
-    // For WUD files from disc dumps, the structure is different
-    // Let's try to find FST by scanning the first few MB
-    let fst_data = find_and_extract_fst(&mut reader, options.title_key, GM_PARTITION_OFFSET)?;
+    // Search for FST in the GM partition
+    let fst_data = find_and_extract_fst(&mut reader, options.title_key, gm_offset)?;
     
     if fst_data.is_empty() {
         return Err(KairoError::InvalidWud("Could not find FST in disc image".into()));
@@ -120,7 +109,7 @@ pub fn extract_wud_to_wup(options: &ExtractOptions) -> Result<()> {
         options,
         &entries,
         &name_table,
-        GM_PARTITION_OFFSET,
+        gm_offset,
         0,
         options.output_dir,
         &mut extracted,
