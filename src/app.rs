@@ -224,6 +224,53 @@ impl KairoApp {
         None // All good!
     }
     
+    /// Try to automatically look up the disc key based on the WUD's product code
+    fn try_auto_lookup_key(&mut self, path: &std::path::Path) {
+        use std::io::{Read, Seek, SeekFrom};
+        
+        // Only for WUD files
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_lowercase())
+            .unwrap_or_default();
+        
+        if ext != "wud" {
+            return;
+        }
+        
+        // Read first 64 bytes of the file to get product code
+        let Ok(mut file) = std::fs::File::open(path) else { return };
+        let mut header = [0u8; 64];
+        if file.read_exact(&mut header).is_err() {
+            return;
+        }
+        
+        // Extract product code
+        let Some(product_code) = crate::disc_keys::extract_product_code(&header) else { 
+            eprintln!("Could not extract product code from WUD header");
+            return;
+        };
+        
+        eprintln!("Detected product code: {}", product_code);
+        
+        // Look up the disc key
+        if let Some(key_hex) = crate::disc_keys::lookup_disc_key(&product_code) {
+            // Get game name for logging
+            let game_name = crate::disc_keys::get_game_name(&product_code).unwrap_or("Unknown Game");
+            let region = crate::disc_keys::get_region(&product_code);
+            
+            eprintln!("🔑 Auto-detected: {} [{}]", game_name, region);
+            eprintln!("   Disc Key: {}", key_hex);
+            
+            // Set the key automatically!
+            self.title_key_hex = key_hex.to_string();
+            self.use_title_hex = true;
+        } else {
+            eprintln!("⚠️ No disc key found for product code: {}", product_code);
+            eprintln!("   You'll need to provide the key manually.");
+        }
+    }
+    
     fn start_operation(&self) {
         let input = self.input_path.clone().unwrap();
         let output = self.output_path.clone().unwrap();
@@ -364,8 +411,11 @@ impl eframe::App for KairoApp {
                     .unwrap_or_else(|| "Select file...".into());
                 ui.label(&text);
                 if ui.button("📁 Browse").clicked() {
-                    self.input_path = self.pick_file(&["wux", "wud"]);
-                    self.save_config();
+                    if let Some(path) = self.pick_file(&["wux", "wud"]) {
+                        self.input_path = Some(path.clone());
+                        self.try_auto_lookup_key(&path);
+                        self.save_config();
+                    }
                 }
             });
             
