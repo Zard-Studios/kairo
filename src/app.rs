@@ -5,8 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::keys;
-use crate::wux;
+// Note: crate::keys and crate::wux are unused - using external wux crate
 
 /// Operation mode
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -127,24 +126,39 @@ impl KairoApp {
         thread::spawn(move || {
             let result = match operation {
                 Operation::ConvertToWud => {
-                    // WUX -> WUD conversion
-                    let output_file = if output.is_dir() {
+                    // WUX -> WUD conversion using external wux crate
+                    let output_path = if output.is_dir() {
                         let name = input.file_stem().unwrap_or_default();
                         output.join(format!("{}.wud", name.to_string_lossy()))
                     } else {
                         output
                     };
                     
-                    let progress_clone = Arc::clone(&progress);
-                    wux::decompress_wux(
-                        &input,
-                        &output_file,
-                        Some(Box::new(move |percent, msg| {
-                            let mut p = progress_clone.lock().unwrap();
-                            p.percent = percent;
-                            p.message = msg.to_string();
-                        })),
-                    )
+                    // Open files
+                    let input_file = std::fs::File::open(&input);
+                    let output_file = std::fs::File::create(&output_path);
+                    
+                    match (input_file, output_file) {
+                        (Ok(mut reader), Ok(mut writer)) => {
+                            let progress_clone = Arc::clone(&progress);
+                            
+                            ::wux::decompress_with_progress(
+                                &mut reader,
+                                &mut writer,
+                                |wux_progress| {
+                                    let mut p = progress_clone.lock().unwrap();
+                                    p.percent = wux_progress.bytes_processed as f32 / wux_progress.total_bytes as f32;
+                                    let mb_done = wux_progress.bytes_processed / 1_000_000;
+                                    let mb_total = wux_progress.total_bytes / 1_000_000;
+                                    p.message = format!("{} MB / {} MB", mb_done, mb_total);
+                                },
+                            ).map_err(|e| crate::error::KairoError::Io(
+                                std::io::Error::new(std::io::ErrorKind::Other, format!("{:?}", e))
+                            ))
+                        }
+                        (Err(e), _) => Err(crate::error::KairoError::Io(e)),
+                        (_, Err(e)) => Err(crate::error::KairoError::Io(e)),
+                    }
                 }
                 Operation::ExtractToWup => {
                     // WUD -> WUP extraction

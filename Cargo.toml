@@ -22,6 +22,7 @@ sha1 = "0.10"
 # Utils
 thiserror = "2.0"
 rfd = "0.15"          # Native file dialogs
+wux = "0.1"           # WUX decompression (tested implementation)
 
 [profile.release]
 opt-level = "z"       # Optimize for size
