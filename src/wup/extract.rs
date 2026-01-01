@@ -87,7 +87,7 @@ pub fn extract_wud_to_wup(options: &ExtractOptions) -> Result<()> {
     ));
     
     // Search for FST in the GM partition
-    let fst_data = find_and_extract_fst(&mut reader, options.title_key, gm_offset)?;
+    let fst_data = find_and_extract_fst(&mut reader, options.title_key, gm_offset, Some(options.common_key))?;
     
     if fst_data.is_empty() {
         return Err(KairoError::InvalidWud("Could not find FST in disc image".into()));
@@ -127,111 +127,88 @@ fn find_and_extract_fst<R: Read + Seek>(
     reader: &mut BufReader<R>,
     key: &[u8; 16],
     partition_offset: u64,
+    common_key: Option<&[u8; 16]>, // Add common key for title key decryption
 ) -> Result<Vec<u8>> {
     const NUM_SECTORS: usize = 4;
-    let mut header_data = vec![0u8; SECTOR_SIZE * NUM_SECTORS];
+    
+    // Debug: Read WUD header (first sector) to find Title ID
+    let current_pos = reader.stream_position()?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut disc_header = [0u8; 0x400];
+    reader.read_exact(&mut disc_header)?;
+    
+    // Title ID is typically at 0x18C? Or near the start?
+    // Let's print potential chunks
+    eprintln!("Header dump [0x180..0x1A0]: {:02X?}", &disc_header[0x180..0x1A0]);
+    
+    // Restore position
     reader.seek(SeekFrom::Start(partition_offset))?;
+    
+    let mut header_data = vec![0u8; SECTOR_SIZE * NUM_SECTORS];
     reader.read_exact(&mut header_data)?;
     
-    // Try Relative IVs first (standard)
-    let mut decrypted_relative = header_data.clone();
-    for sector_idx in 0..NUM_SECTORS {
-        let start = sector_idx * SECTOR_SIZE;
-        let end = start + SECTOR_SIZE;
-        let mut iv = [0u8; 16];
-        iv[..8].copy_from_slice(&(sector_idx as u64).to_be_bytes());
-        decrypt_sector(&mut decrypted_relative[start..end], key, &iv);
-    }
-    
-    if let Some(fst) = check_fst(&decrypted_relative) {
-        eprintln!("Found FST using Relative IVs");
-        return Ok(fst);
-    }
-    
-    // Try Absolute IVs
-    let abs_sector_start = partition_offset / SECTOR_SIZE as u64;
-    let mut decrypted_absolute = header_data.clone();
-    for sector_idx in 0..NUM_SECTORS {
-        let start = sector_idx * SECTOR_SIZE;
-        let end = start + SECTOR_SIZE;
-        let mut iv = [0u8; 16];
-        iv[..8].copy_from_slice(&(abs_sector_start + sector_idx as u64).to_be_bytes());
-        decrypt_sector(&mut decrypted_absolute[start..end], key, &iv);
-    }
-    
-    if let Some(fst) = check_fst(&decrypted_absolute) {
-        eprintln!("Found FST using Absolute IVs");
-        return Ok(fst);
-    }
-    
-    // Debug: Check fallback offset at 0x424 in both versions
-    // Check Relative attempt
-    eprintln!("Relative IV decrypt sample (first 16 bytes): {:02X?}", &decrypted_relative[0..16]);
-    // Check offsets at 0x424
-    if decrypted_relative.len() > 0x428 {
-        let off_rel = u32::from_be_bytes([
-            decrypted_relative[0x424], decrypted_relative[0x425], 
-            decrypted_relative[0x426], decrypted_relative[0x427]
-        ]);
-        eprintln!("Offset at 0x424 (Rel IV): 0x{:08X}", off_rel);
-    }
-    
-    // Check Absolute attempt
-    eprintln!("Absolute IV decrypt sample (first 16 bytes): {:02X?}", &decrypted_absolute[0..16]);
-    
-    // As a last ditch effort, try using the fallback 0x424 offset logic 
-    // from the RELATIVE decrypted data (more likely)
-    if decrypted_relative.len() > 0x428 {
-        let fst_offset_raw = u32::from_be_bytes([
-            decrypted_relative[0x424], decrypted_relative[0x425], 
-            decrypted_relative[0x426], decrypted_relative[0x427]
-        ]);
-        let fst_offset = (fst_offset_raw as u64) * 4;
+    // Helper to try a key
+    let try_key = |test_key: &[u8; 16], key_name: &str| -> Option<Vec<u8>> {
+        eprintln!("Trying {} Key: {:02X?}", key_name, test_key);
         
-        if fst_offset > 0 && fst_offset < 100 * 1024 * 1024 { // Sanity check 100MB
-            // Found a plausible offset, let's try to read it
-            eprintln!("Trying FST offset 0x{:X} from header", fst_offset);
-            
-            // Need to read at this new location
-            let abs_offset = partition_offset + fst_offset;
-            reader.seek(SeekFrom::Start(abs_offset))?;
-            
-            // Read 32 bytes to check header
-            let mut fst_header = [0u8; 32];
-            if reader.read_exact(&mut fst_header).is_ok() {
-                // Decrypt with relative IV
-                let sector_idx = fst_offset / SECTOR_SIZE as u64;
-                let mut iv = [0u8; 16];
-                iv[..8].copy_from_slice(&sector_idx.to_be_bytes()); // Try relative first
-                decrypt_sector(&mut fst_header, key, &iv);
-                
-                let magic = u32::from_be_bytes([fst_header[0], fst_header[1], fst_header[2], fst_header[3]]);
-                if magic == FST_MAGIC {
-                     eprintln!("Found FST at pointed offset!");
-                     // Read full FST
-                     let entry_count = u32::from_be_bytes([
-                        fst_header[8], fst_header[9], fst_header[10], fst_header[11]
-                    ]) as usize;
-                    
-                    if entry_count > 0 && entry_count < 100_000 {
-                         let fst_size = 0x20 + entry_count * 0x10 + 0x10000;
-                         reader.seek(SeekFrom::Start(abs_offset))?;
-                         let mut fst_data = vec![0u8; fst_size];
-                         if reader.read(&mut fst_data).is_ok() {
-                             // Decrypt
-                             let num_sectors = (fst_size + SECTOR_SIZE - 1) / SECTOR_SIZE;
-                             for s in 0..num_sectors {
-                                 let start = s * SECTOR_SIZE;
-                                 let end = std::cmp::min(start + SECTOR_SIZE, fst_data.len());
-                                 let mut iv = [0u8; 16];
-                                 iv[..8].copy_from_slice(&(sector_idx + s as u64).to_be_bytes());
-                                 decrypt_sector(&mut fst_data[start..end], key, &iv);
-                             }
-                             return Ok(fst_data);
-                         }
-                    }
-                }
-            }
+        // Try Relative IVs
+        let mut decrypted = header_data.clone();
+        for sector_idx in 0..NUM_SECTORS {
+            let start = sector_idx * SECTOR_SIZE;
+            let end = start + SECTOR_SIZE;
+            let mut iv = [0u8; 16];
+            iv[..8].copy_from_slice(&(sector_idx as u64).to_be_bytes());
+            decrypt_sector(&mut decrypted[start..end], test_key, &iv);
+        }
+        
+        if let Some(fst) = check_fst(&decrypted) {
+            eprintln!("Found FST using {} Key + Relative IVs", key_name);
+            return Some(fst);
+        }
+        
+        // Try Absolute IVs
+        let abs_sector_start = partition_offset / SECTOR_SIZE as u64;
+        let mut decrypted_abs = header_data.clone();
+        for sector_idx in 0..NUM_SECTORS {
+            let start = sector_idx * SECTOR_SIZE;
+            let end = start + SECTOR_SIZE;
+            let mut iv = [0u8; 16];
+            iv[..8].copy_from_slice(&(abs_sector_start + sector_idx as u64).to_be_bytes());
+            decrypt_sector(&mut decrypted_abs[start..end], test_key, &iv);
+        }
+        
+        if let Some(fst) = check_fst(&decrypted_abs) {
+            eprintln!("Found FST using {} Key + Absolute IVs", key_name);
+            return Some(fst);
+        }
+        
+        None
+    };
+    
+    // 1. Try provided key directly
+    if let Some(fst) = try_key(key, "Provided") {
+        return Ok(fst);
+    }
+    
+    // 2. Try decrypting the provided key (assuming it's an Encrypted Title Key)
+    if let Some(comm_key) = common_key {
+        // We need the Title ID to decrypt the key. It's usually in the disc header.
+        // Let's try to grab it from offset 0x18C ??
+        let title_id_slice = &disc_header[0x18C..0x194]; // 8 bytes
+        eprintln!("Potential Title ID at 0x18C: {:02X?}", title_id_slice);
+        
+        let mut decrypted_title_key = *key;
+        let mut iv = [0u8; 16];
+        iv[..8].copy_from_slice(title_id_slice);
+        // iv[8..] is 0
+        
+        eprintln!("Decrypting Title Key using Common Key and IV (TitleID): {:02X?}", iv);
+        crate::wud::decrypt::decrypt_buffer(&mut decrypted_title_key, comm_key, &iv);
+        
+        eprintln!("Decrypted Title Key candidate: {:02X?}", decrypted_title_key);
+        
+        if let Some(fst) = try_key(&decrypted_title_key, "Decrypted") {
+            return Ok(fst);
         }
     }
     
