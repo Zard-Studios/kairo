@@ -64,19 +64,40 @@ impl PartitionTable {
             }
         }
         
+        // Check file size for debugging
+        let file_len = reader.seek(SeekFrom::End(0))?;
+        eprintln!("File size: {} bytes ({:.2} GB)", file_len, file_len as f64 / 1024.0 / 1024.0 / 1024.0);
+        
+        // Restore position
+        reader.seek(SeekFrom::Start(0))?;
+
         // If that fails, try scanning for known game partition patterns
-        // Retail WUD discs often have the GM partition at 0x10000000
+        // Retail WUD discs often have the GM partition at 0x10000000 ? Or 0x20000 ?
         eprintln!("Standard partition table not found, using fallback offsets");
         
+        // For Wii Party U / Standard WUDs, Game Partition is often at 0x1180000 ??
+        // Actually, if partition table is at 0x18000, maybe partitions start soon after?
+        // Let's try to assume 0x00020000 (Cluster 4?) or just try to find FST by scanning?
+        
         // Create a synthetic partition table with common offsets
+        // Try to match what Cemu/others expect
         let partitions = vec![
             Partition {
                 partition_type: PartitionType::GM,
-                offset: 0x10000000,  // 256MB - common GM offset
-                size: 0x500000000,   // ~20GB
+                offset: 0x18000000,  // 384MB?? Some games are here.
+                size: file_len.saturating_sub(0x18000000),   
+                title_key: None,
+            },
+            Partition {
+                partition_type: PartitionType::GM,
+                offset: 0x10000,     // 64KB ??
+                size: file_len.saturating_sub(0x10000), 
                 title_key: None,
             }
         ];
+        
+        // We really should just rely on the Game Partition search logic 
+        // to iterate over these "fake" partitions and check for FST headers
         
         Ok(Self { partitions })
     }

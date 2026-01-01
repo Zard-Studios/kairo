@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use aes::Aes128;
 use cbc::{Decryptor, cipher::{BlockDecryptMut, KeyIvInit}};
 
+use crate::wud::{Partition, PartitionType};
 use crate::error::{KairoError, Result};
 
 type Aes128CbcDec = Decryptor<Aes128>;
@@ -71,14 +72,67 @@ pub fn extract_wud_to_wup(options: &ExtractOptions) -> Result<()> {
     
     // Read partition table from 0x18000 to find actual GM partition offset
     // Pass common key to decrypt table entries
-    let partition_table = crate::wud::PartitionTable::read(&mut reader, options.common_key)?;
+    let table = crate::wud::PartitionTable::read(&mut reader, options.common_key)?;
     
-    // Find GM partition
-    let gm_partition = partition_table.game_partition()
-        .ok_or_else(|| KairoError::InvalidWud("No GM partition found".into()))?;
+    // Try to find GM partition and extract FST
+    // Iterate over *all* partitions marked as GM, because standard lookup might fail
+    // and we might have multiple candidates in fallback
+    let gm_partitions: Vec<&Partition> = table.partitions.iter()
+        .filter(|p| p.partition_type == PartitionType::GM)
+        .collect();
+        
+    eprintln!("Found {} candidate GM partitions to check", gm_partitions.len());
+
+    let mut fst_content = Vec::new();
+    let mut active_partition = None;
     
-    let gm_offset = gm_partition.offset;
-    let gm_size = gm_partition.size;
+    // Read the first 0x400 bytes of the WUD for potential Title ID extraction
+    let current_pos = reader.stream_position()?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut header = [0u8; 0x400];
+    reader.read_exact(&mut header)?;
+    reader.seek(SeekFrom::Start(current_pos))?; // Restore position
+
+    for (i, partition_info) in gm_partitions.iter().enumerate() {
+        eprintln!("Checking Candidate Partition #{}: Offset 0x{:X}", i, partition_info.offset);
+        
+        let mut key_to_use = options.title_key;
+        if let Some(pkey) = partition_info.title_key.as_ref() {
+             eprintln!("  (Using partition-specific Title Key)");
+             key_to_use = pkey;
+        }
+
+        // Try to find/extract FST from this partition
+        match find_and_extract_fst(
+            &mut reader, 
+            partition_info.offset, 
+            key_to_use,
+            Some(options.common_key), // Pass common key for decryption attempts
+            &header
+        ) {
+            Ok(fst) if !fst.is_empty() => {
+                fst_content = fst;
+                active_partition = Some(*partition_info);
+                eprintln!("Valid FST found in partition at 0x{:X}!", partition_info.offset);
+                break;
+            }
+            Ok(_) => {
+                eprintln!("  No FST found in this partition (decryption valid but magic missing?)");
+            }
+            Err(e) => {
+                eprintln!("  Error checking partition: {:?}", e);
+            }
+        }
+    }
+
+    if fst_content.is_empty() {
+        return Err(KairoError::InvalidWud("Could not find FST in disc image (checked all candidates)".to_string()));
+    }
+    
+    let partition_info = active_partition.unwrap(); // access the reference
+
+    let gm_offset = partition_info.offset;
+    let gm_size = partition_info.size;
     
     report_progress(&options.progress, 0.1, &format!(
         "Found GM partition at offset 0x{:X}, size {} MB", 
@@ -86,17 +140,10 @@ pub fn extract_wud_to_wup(options: &ExtractOptions) -> Result<()> {
         gm_size / 1_000_000
     ));
     
-    // Search for FST in the GM partition
-    let fst_data = find_and_extract_fst(&mut reader, options.title_key, gm_offset, Some(options.common_key))?;
-    
-    if fst_data.is_empty() {
-        return Err(KairoError::InvalidWud("Could not find FST in disc image".into()));
-    }
-    
     report_progress(&options.progress, 0.2, "Parsing FST...");
     
     // Parse FST entries
-    let (entries, name_table) = parse_fst(&fst_data)?;
+    let (entries, name_table) = parse_fst(&fst_content)?;
     
     report_progress(&options.progress, 0.25, &format!("Found {} entries, extracting...", entries.len()));
     
@@ -124,29 +171,38 @@ pub fn extract_wud_to_wup(options: &ExtractOptions) -> Result<()> {
 
 /// Find FST by reading partition header
 fn find_and_extract_fst<R: Read + Seek>(
-    reader: &mut BufReader<R>,
-    key: &[u8; 16],
+    reader: &mut R,
     partition_offset: u64,
-    common_key: Option<&[u8; 16]>, // Add common key for title key decryption
+    key: &[u8; 16],
+    common_key: Option<&[u8; 16]>,
+    _disc_header: &[u8]
 ) -> Result<Vec<u8>> {
-    const NUM_SECTORS: usize = 4;
+    eprintln!("Searching for FST in partition at 0x{:X}...", partition_offset);
     
-    // Debug: Read WUD header (first sector) to find Title ID
-    let current_pos = reader.stream_position()?;
-    reader.seek(SeekFrom::Start(0))?;
-    let mut disc_header = [0u8; 0x400];
-    reader.read_exact(&mut disc_header)?;
+    // Read the first few sectors of the partition
+    // The FST is usually at the start of the partition's data area (boot.bin, etc.)
+    // But it's encrypted.
     
-    // Print first 64 bytes to identify format
-    eprintln!("File Start [0x00..0x40]: {:02X?}", &disc_header[0x00..0x40]);
-    // Print Title ID area
-    eprintln!("Header dump [0x180..0x1A0]: {:02X?}", &disc_header[0x180..0x1A0]);
+    // The boot.bin / FST header is in the first encrypted block (cluster 0, sector 0?)
+    // Actually, usually headers are at start of partition.
     
-    // Restore position
+    // Read enough data to cover potential FST header
+    const NUM_SECTORS: usize = 2; // Read 2 sectors (64KB)
+    
+    // Validate offset against file size?
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    if partition_offset >= file_len {
+         eprintln!("  Skipping partition: offset 0x{:X} >= file length 0x{:X}", partition_offset, file_len);
+         return Ok(Vec::new());
+    }
+    
     reader.seek(SeekFrom::Start(partition_offset))?;
     
     let mut header_data = vec![0u8; SECTOR_SIZE * NUM_SECTORS];
-    reader.read_exact(&mut header_data)?;
+    if let Err(e) = reader.read_exact(&mut header_data) {
+        eprintln!("  Failed to read partition header: {}", e);
+        return Ok(Vec::new());
+    }
     
     // Helper to try a key
     let try_key = |test_key: &[u8; 16], key_name: &str| -> Option<Vec<u8>> {
@@ -159,8 +215,10 @@ fn find_and_extract_fst<R: Read + Seek>(
             let end = start + SECTOR_SIZE;
             let mut iv = [0u8; 16];
             iv[..8].copy_from_slice(&(sector_idx as u64).to_be_bytes());
-            decrypt_sector(&mut decrypted[start..end], test_key, &iv);
+            crate::wud::decrypt::decrypt_buffer(&mut decrypted[start..end], test_key, &iv);
         }
+        
+        eprintln!("  [{}] Relative IV Decrypt (First 16 bytes): {:02X?}", key_name, &decrypted[0..16]);
         
         if let Some(fst) = check_fst(&decrypted) {
             eprintln!("Found FST using {} Key + Relative IVs", key_name);
@@ -175,8 +233,10 @@ fn find_and_extract_fst<R: Read + Seek>(
             let end = start + SECTOR_SIZE;
             let mut iv = [0u8; 16];
             iv[..8].copy_from_slice(&(abs_sector_start + sector_idx as u64).to_be_bytes());
-            decrypt_sector(&mut decrypted_abs[start..end], test_key, &iv);
+            crate::wud::decrypt::decrypt_buffer(&mut decrypted_abs[start..end], test_key, &iv);
         }
+        
+        eprintln!("  [{}] Absolute IV Decrypt (First 16 bytes): {:02X?}", key_name, &decrypted_abs[0..16]);
         
         if let Some(fst) = check_fst(&decrypted_abs) {
             eprintln!("Found FST using {} Key + Absolute IVs", key_name);
@@ -328,7 +388,7 @@ fn get_name(name_table: &[u8], offset: u32) -> String {
 
 /// Extract all entries recursively  
 fn extract_entries<R: Read + Seek>(
-    reader: &mut BufReader<R>,
+    reader: &mut R,
     options: &ExtractOptions,
     entries: &[FstEntry],
     name_table: &[u8],
@@ -391,7 +451,7 @@ fn extract_entries<R: Read + Seek>(
 
 /// Extract a single file
 fn extract_file<R: Read + Seek>(
-    reader: &mut BufReader<R>,
+    reader: &mut R,
     options: &ExtractOptions,
     offset: u64,
     size: u64,
