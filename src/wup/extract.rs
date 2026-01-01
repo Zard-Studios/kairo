@@ -137,8 +137,9 @@ fn find_and_extract_fst<R: Read + Seek>(
     let mut disc_header = [0u8; 0x400];
     reader.read_exact(&mut disc_header)?;
     
-    // Title ID is typically at 0x18C? Or near the start?
-    // Let's print potential chunks
+    // Print first 64 bytes to identify format
+    eprintln!("File Start [0x00..0x40]: {:02X?}", &disc_header[0x00..0x40]);
+    // Print Title ID area
     eprintln!("Header dump [0x180..0x1A0]: {:02X?}", &disc_header[0x180..0x1A0]);
     
     // Restore position
@@ -192,23 +193,45 @@ fn find_and_extract_fst<R: Read + Seek>(
     
     // 2. Try decrypting the provided key (assuming it's an Encrypted Title Key)
     if let Some(comm_key) = common_key {
-        // We need the Title ID to decrypt the key. It's usually in the disc header.
-        // Let's try to grab it from offset 0x18C ??
-        let title_id_slice = &disc_header[0x18C..0x194]; // 8 bytes
-        eprintln!("Potential Title ID at 0x18C: {:02X?}", title_id_slice);
+        // We need the Title ID to decrypt the key. 
+        // Typically at 0x18C, but dump showed zeros.
+        // Let's scan the first sector for a Title ID pattern (starts with 00 05 00 ...)
+        let mut title_id = [0u8; 8];
+        let mut found_tid = false;
         
-        let mut decrypted_title_key = *key;
-        let mut iv = [0u8; 16];
-        iv[..8].copy_from_slice(title_id_slice);
-        // iv[8..] is 0
+        // Check 0x18C first
+        if disc_header[0x18C] == 0x00 && disc_header[0x18D] == 0x05 {
+             title_id.copy_from_slice(&disc_header[0x18C..0x194]);
+             found_tid = true;
+        } else {
+            // Scan
+            for i in (0..0x400).step_by(4) {
+                if disc_header[i] == 0x00 && disc_header[i+1] == 0x05 && disc_header[i+2] == 0x00 {
+                    // Possible Title ID
+                    title_id.copy_from_slice(&disc_header[i..i+8]);
+                    eprintln!("Found potential Title ID at 0x{:X}: {:02X?}", i, title_id);
+                    found_tid = true;
+                    break;
+                }
+            }
+        }
         
-        eprintln!("Decrypting Title Key using Common Key and IV (TitleID): {:02X?}", iv);
-        crate::wud::decrypt::decrypt_buffer(&mut decrypted_title_key, comm_key, &iv);
-        
-        eprintln!("Decrypted Title Key candidate: {:02X?}", decrypted_title_key);
-        
-        if let Some(fst) = try_key(&decrypted_title_key, "Decrypted") {
-            return Ok(fst);
+        if found_tid {
+            let mut decrypted_title_key = *key;
+            let mut iv = [0u8; 16];
+            iv[..8].copy_from_slice(&title_id);
+            // iv[8..] is 0
+            
+            eprintln!("Decrypting Title Key using Common Key and IV (TitleID): {:02X?}", iv);
+            crate::wud::decrypt::decrypt_buffer(&mut decrypted_title_key, comm_key, &iv);
+            
+            eprintln!("Decrypted Title Key candidate: {:02X?}", decrypted_title_key);
+            
+            if let Some(fst) = try_key(&decrypted_title_key, "Decrypted") {
+                return Ok(fst);
+            }
+        } else {
+            eprintln!("Could not find Title ID in header - cannot decrypt Title Key properly.");
         }
     }
     

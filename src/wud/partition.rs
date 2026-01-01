@@ -82,67 +82,100 @@ impl PartitionTable {
     }
     
     fn try_read_at<R: Read + Seek>(
-        reader: &mut R, 
-        table_offset: u64, 
-        common_key: &[u8; 16]
-    ) -> Result<Self> {
-        reader.seek(SeekFrom::Start(table_offset))?;
-        
-        let mut partitions = Vec::new();
-        
-        // Read partition entries (max 4 partitions)
-        for i in 0..4 {
-            let mut entry = [0u8; 32];
-            reader.read_exact(&mut entry)?;
+            reader: &mut R, 
+            table_offset: u64, 
+            common_key: &[u8; 16]
+        ) -> Result<Self> {
+            reader.seek(SeekFrom::Start(table_offset))?;
             
-            // Decrypt the entry using Common Key
-            // IV is typically 0 for the partition table
-            let iv = [0u8; 16]; 
-            crate::wud::decrypt::decrypt_buffer(&mut entry, common_key, &iv);
+            let mut raw_entries = Vec::new();
+            for _ in 0..4 {
+                let mut entry = [0u8; 32];
+                reader.read_exact(&mut entry)?;
+                raw_entries.push(entry);
+            }
             
-            // Debug: print decrypted bytes
-            eprintln!("Partition {} decrypted (IV=0): {:02X?}", i, &entry[..8]);
+            // Try different IV candidates
+            let iv_candidates: Vec<([u8; 16], &str)> = vec![
+                ([0u8; 16], "Zero"),
+                ({
+                    let mut iv = [0u8; 16];
+                    iv[..8].copy_from_slice(&(table_offset / 0x8000).to_be_bytes());
+                    (iv, "Sector Index (3)")
+                }),
+                 ({
+                    let mut iv = [0u8; 16];
+                    iv[..8].copy_from_slice(&(table_offset).to_be_bytes());
+                    (iv, "Offset")
+                }),
+            ];
             
-            let type_id = u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            for (iv, name) in iv_candidates {
+                let mut partitions = Vec::new();
+                let mut valid_count = 0;
+                
+                eprintln!("Trying Partition Table Decryption with IV: {} ({:02X?})", name, &iv[..8]);
+                
+                for (i, raw) in raw_entries.iter().enumerate() {
+                    let mut entry = *raw;
+                    crate::wud::decrypt::decrypt_buffer(&mut entry, common_key, &iv);
+                    
+                    let type_id = u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]);
+                    
+                    let partition_type = match type_id {
+                        0x5349 => PartitionType::SI, // SI
+                        0x5550 => PartitionType::UP, // UP
+                        0x4749 => PartitionType::GI, // GI
+                        0x474D => PartitionType::GM, // GM
+                         _ => {
+                             // If the first bytes are 0 (unused entry), it's valid but empty
+                             if type_id == 0 {
+                                 continue;
+                             }
+                             // Invalid type
+                             // eprintln!("  Entry {} invalid type: {:08X}", i, type_id);
+                             break; 
+                         },
+                    };
+                    
+                    valid_count += 1;
+                    
+                     let offset = u64::from_be_bytes([
+                        entry[4], entry[5], entry[6], entry[7],
+                        entry[8], entry[9], entry[10], entry[11],
+                    ]);
+                    
+                    let size = u64::from_be_bytes([
+                        entry[12], entry[13], entry[14], entry[15],
+                        entry[16], entry[17], entry[18], entry[19],
+                    ]);
+                    
+                    eprintln!("  Found {} partition at 0x{:X}, size {}", 
+                        match partition_type { 
+                            PartitionType::SI => "SI",
+                            PartitionType::UP => "UP", 
+                            PartitionType::GI => "GI",
+                            PartitionType::GM => "GM",
+                            _ => "??",
+                        }, offset, size);
+                        
+                    partitions.push(Partition {
+                        partition_type,
+                        offset,
+                        size,
+                        title_key: None,
+                    });
+                }
+                
+                // If we found at least one valid partition, return it
+                if valid_count > 0 {
+                    eprintln!("Successfully decrypted partition table with IV: {}", name);
+                    return Ok(Self { partitions });
+                }
+            }
             
-            // Check for valid partition type markers (SI, UP, GI, GM)
-            let partition_type = match type_id {
-                0x5349 => PartitionType::SI,
-                0x5550 => PartitionType::UP,
-                0x4749 => PartitionType::GI,
-                0x474D => PartitionType::GM,
-                _ => continue, // Skip invalid entries
-            };
-            
-            let offset = u64::from_be_bytes([
-                entry[4], entry[5], entry[6], entry[7],
-                entry[8], entry[9], entry[10], entry[11],
-            ]);
-            
-            let size = u64::from_be_bytes([
-                entry[12], entry[13], entry[14], entry[15],
-                entry[16], entry[17], entry[18], entry[19],
-            ]);
-            
-            eprintln!("  Found {} partition at 0x{:X}, size {}", 
-                match partition_type { 
-                    PartitionType::SI => "SI",
-                    PartitionType::UP => "UP", 
-                    PartitionType::GI => "GI",
-                    PartitionType::GM => "GM",
-                    _ => "??",
-                }, offset, size);
-            
-            partitions.push(Partition {
-                partition_type,
-                offset,
-                size,
-                title_key: None,
-            });
+            Ok(Self { partitions: Vec::new() })
         }
-        
-        Ok(Self { partitions })
-    }
     
     /// Find the GM (game data) partition
     pub fn game_partition(&self) -> Option<&Partition> {

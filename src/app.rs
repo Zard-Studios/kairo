@@ -4,8 +4,47 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use serde::{Deserialize, Serialize};
+use directories::ProjectDirs;
 
 // Note: crate::keys and crate::wux are unused - using external wux crate
+
+/// Configuration persisted to disk
+#[derive(Default, Serialize, Deserialize)]
+struct AppConfig {
+    input_path: Option<PathBuf>,
+    output_path: Option<PathBuf>,
+    common_key_path: Option<PathBuf>,
+    common_key_hex: String,
+    title_key_path: Option<PathBuf>,
+    title_key_hex: String,
+}
+
+impl AppConfig {
+    fn load() -> Self {
+        if let Some(proj_dirs) = ProjectDirs::from("com", "zardstudios", "kairo") {
+            let config_path = proj_dirs.config_dir().join("config.json");
+            if let Ok(file) = std::fs::File::open(config_path) {
+                if let Ok(config) = serde_json::from_reader(file) {
+                    return config;
+                }
+            }
+        }
+        Self::default()
+    }
+
+    fn save(&self) {
+        if let Some(proj_dirs) = ProjectDirs::from("com", "zardstudios", "kairo") {
+            let config_dir = proj_dirs.config_dir();
+            if std::fs::create_dir_all(config_dir).is_ok() {
+                let config_path = config_dir.join("config.json");
+                if let Ok(file) = std::fs::File::create(config_path) {
+                    let _ = serde_json::to_writer_pretty(file, self);
+                }
+            }
+        }
+    }
+}
 
 /// Operation mode
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -56,20 +95,34 @@ pub struct Progress {
 
 impl KairoApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let config = AppConfig::load();
+        
         Self {
-            input_path: None,
-            output_path: None,
-            common_key_path: None,
-            common_key_hex: String::new(),
-            use_common_hex: false,
-            title_key_path: None,
-            title_key_hex: String::new(),
-            use_title_hex: false,
+            input_path: config.input_path,
+            output_path: config.output_path,
+            common_key_path: config.common_key_path,
+            common_key_hex: config.common_key_hex.clone(),
+            use_common_hex: !config.common_key_hex.is_empty(),
+            title_key_path: config.title_key_path,
+            title_key_hex: config.title_key_hex.clone(),
+            use_title_hex: !config.title_key_hex.is_empty(),
             operation: Operation::default(),
             verify_hashes: true,
             progress: Arc::new(Mutex::new(Progress::default())),
             status: Arc::new(Mutex::new(Status::Idle)),
         }
+    }
+    
+    fn save_config(&self) {
+        let config = AppConfig {
+            input_path: self.input_path.clone(),
+            output_path: self.output_path.clone(),
+            common_key_path: self.common_key_path.clone(),
+            common_key_hex: self.common_key_hex.clone(),
+            title_key_path: self.title_key_path.clone(),
+            title_key_hex: self.title_key_hex.clone(),
+        };
+        config.save();
     }
     
     fn pick_file(&self, filter: &[&str]) -> Option<PathBuf> {
@@ -251,6 +304,7 @@ impl eframe::App for KairoApp {
                 ui.label(&text);
                 if ui.button("📁 Browse").clicked() {
                     self.input_path = self.pick_file(&["wux", "wud"]);
+                    self.save_config();
                 }
             });
             
@@ -264,6 +318,7 @@ impl eframe::App for KairoApp {
                 ui.label(&text);
                 if ui.button("📁 Browse").clicked() {
                     self.output_path = self.pick_folder();
+                    self.save_config();
                 }
             });
             
@@ -274,9 +329,11 @@ impl eframe::App for KairoApp {
             ui.horizontal(|ui| {
                 ui.label("Common:");
                 if self.use_common_hex {
-                    ui.add(egui::TextEdit::singleline(&mut self.common_key_hex)
+                    if ui.add(egui::TextEdit::singleline(&mut self.common_key_hex)
                         .hint_text("32 hex chars (e.g. D7B0...)")
-                        .desired_width(250.0));
+                        .desired_width(250.0)).changed() {
+                            self.save_config();
+                        }
                     let valid = self.common_key_hex.len() == 32;
                     ui.label(if valid { "✅" } else { "❌" });
                 } else {
@@ -287,6 +344,7 @@ impl eframe::App for KairoApp {
                     }
                     if ui.button("Browse").clicked() {
                         self.common_key_path = self.pick_key_file();
+                        self.save_config();
                     }
                 }
                 if ui.button(if self.use_common_hex { "📄 File" } else { "🔢 Hex" }).clicked() {
@@ -298,9 +356,11 @@ impl eframe::App for KairoApp {
             ui.horizontal(|ui| {
                 ui.label("Title:");
                 if self.use_title_hex {
-                    ui.add(egui::TextEdit::singleline(&mut self.title_key_hex)
+                    if ui.add(egui::TextEdit::singleline(&mut self.title_key_hex)
                         .hint_text("32 hex chars")
-                        .desired_width(250.0));
+                        .desired_width(250.0)).changed() {
+                            self.save_config();
+                        }
                     let valid = self.title_key_hex.len() == 32;
                     ui.label(if valid { "✅" } else { "❌" });
                 } else {
@@ -311,6 +371,7 @@ impl eframe::App for KairoApp {
                     }
                     if ui.button("Browse").clicked() {
                         self.title_key_path = self.pick_key_file();
+                        self.save_config();
                     }
                 }
                 if ui.button(if self.use_title_hex { "📄 File" } else { "🔢 Hex" }).clicked() {
@@ -358,6 +419,7 @@ impl eframe::App for KairoApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let can_start = self.can_start();
                     if ui.add_enabled(can_start, egui::Button::new("▶ Start")).clicked() {
+                        self.save_config(); // Save also on start to be sure
                         self.start_operation();
                     }
                     
