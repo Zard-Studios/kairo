@@ -7,10 +7,14 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock};
 use serde::Deserialize;
 
-// Known URLs for Wii U title keys
+// Known URLs for Wii U keys
 const KEY_URLS: &[&str] = &[
-    "http://wiiutitlekeys.ddns.net/json", // Common community database (JSON)
-    "https://titlekeys.ovh/json",         // Mirror (JSON)
+    // GitHub Gist with WUD Disc Keys (format: KEY # Game Name [REGION, WUD])
+    "https://gist.githubusercontent.com/xXPhenomXx/093b352723ec51644453a9528a8dc87e/raw",
+    "https://gist.githubusercontent.com/ClassicOldSong/024b2176d5a413f499db6bc26d272943/raw",
+    // NUS/eShop databases (fallback, less useful for WUD)
+    "http://wiiutitlekeys.ddns.net/json",
+    "https://titlekeys.ovh/json",
 ];
 
 /// Database of known disc keys, indexed by product code (e.g., "ANXP")
@@ -81,12 +85,37 @@ fn fetch_keys_from_url(url: &str) -> std::result::Result<usize, FetchError> {
         }
     }
     
-    // Try Parsing as Pipe/Text format
-    // Format usually: TitleID|Key|Name...
+    // Try Parsing as Pipe/Text format (TitleID|Key|Name...)
+    // Or Gist format: KEY # Game Name [REGION, WUD/NUS]
     let mut count = 0;
     let mut db = DISC_KEYS.write().unwrap();
     
     for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        
+        // Gist format: KEY # Game Name [REGION, WUD]
+        // We only want WUD keys, not NUS keys
+        if line.contains("[") && line.contains("]") {
+            // Check if this is a WUD key
+            if line.contains("WUD]") || line.contains("WUD,") {
+                // Extract the key (first 32 hex chars)
+                let key_part = line.split('#').next().unwrap_or("").trim();
+                if key_part.len() == 32 && key_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                    // Extract game name from comment
+                    if let Some(comment) = line.split('#').nth(1) {
+                        let comment = comment.trim();
+                        // Store by game name (normalized) for fuzzy matching
+                        // Also try to extract region from [EUR, WUD] pattern
+                        db.insert(format!("WUD:{}", comment.to_uppercase()), key_part.to_string());
+                        count += 1;
+                    }
+                }
+            }
+            continue;
+        }
+        
+        // Pipe format: TitleID|Key|Name...
         let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
         if parts.len() >= 2 {
             let id = parts[0];
@@ -129,7 +158,35 @@ pub fn extract_product_code(header: &[u8]) -> Option<String> {
 /// But wait, Ticket has Title ID.
 pub fn lookup_disc_key(product_code: &str) -> Option<String> {
     let db = DISC_KEYS.read().unwrap();
-    db.get(product_code).cloned()
+    
+    // 1. Direct lookup by product code
+    if let Some(key) = db.get(product_code) {
+        return Some(key.clone());
+    }
+    
+    // 2. Try to find a WUD key by game name
+    // First, get the game name from the product code
+    if let Some(game_name) = get_game_name(product_code) {
+        let region = get_region(product_code);
+        
+        // Search for WUD keys matching this game name and region
+        let search_pattern = format!("WUD:{} [{}, WUD]", game_name.to_uppercase(), region);
+        
+        for (key_name, key_value) in db.iter() {
+            if key_name.contains(&search_pattern) {
+                return Some(key_value.clone());
+            }
+            // Also try partial match on game name
+            if key_name.starts_with("WUD:") && 
+               key_name.to_uppercase().contains(&game_name.to_uppercase()) &&
+               key_name.contains(region) &&
+               key_name.contains("WUD]") {
+                return Some(key_value.clone());
+            }
+        }
+    }
+    
+    None
 }
 
 /// Load keys from a local text file (e.g. keys.txt)
@@ -205,11 +262,30 @@ pub fn extract_title_candidates(header: &[u8]) -> Vec<String> {
     candidates
 }
 
-/// Get game name (legacy support for hardcoded codes)
+/// Get game name from product code for WUD key lookup
 pub fn get_game_name(product_code: &str) -> Option<&'static str> {
     match product_code {
-         "ANXP" | "ANXE" | "ANXJ" => Some("Wii Party U"),
-         _ => None,
+        "ANXP" | "ANXE" | "ANXJ" => Some("Wii Party U"),
+        "AMKP" | "AMKE" | "AMKJ" => Some("Mario Kart 8"),
+        "AXFP" | "AXFE" | "AXFJ" => Some("Super Smash Bros."),
+        "ARDP" | "ARDE" | "ARDJ" => Some("Super Mario 3D World"),
+        "ALZP" | "ALZE" | "ALZJ" => Some("The Legend of Zelda: Breath of the Wild"),
+        "AGMP" | "AGME" | "AGMJ" => Some("Splatoon"),
+        "ARPP" | "ARPE" | "ARPJ" => Some("New Super Mario Bros. U"),
+        "ALSP" | "ALSE" | "ALSJ" => Some("New Super Luigi U"),
+        "AKBP" | "AKBE" | "AKBJ" => Some("Pikmin 3"),
+        "AWSP" | "AWSE" | "AWSJ" => Some("Super Mario Maker"),
+        "ASAP" | "ASAE" | "ASAJ" => Some("Xenoblade Chronicles X"),
+        "ACDP" | "ACDE" | "ACDJ" => Some("Hyrule Warriors"),
+        "AAAP" | "AAAE" | "AAAJ" => Some("Bayonetta 2"),
+        "AKTP" | "AKTE" | "AKTJ" => Some("Captain Toad: Treasure Tracker"),
+        "AY9P" | "AY9E" | "AY9J" => Some("Yoshi's Woolly World"),
+        "ADNP" | "ADNE" | "ADNJ" => Some("Donkey Kong Country: Tropical Freeze"),
+        "ATWP" | "ATWE" | "ATWJ" => Some("The Wonderful 101"),
+        "AMSP" | "AMSE" | "AMSJ" => Some("Tokyo Mirage Sessions #FE"),
+        "BWPP" | "BWPE" | "BWPJ" => Some("Paper Mario: Color Splash"),
+        "AKEP" | "AKEE" | "AKEJ" => Some("Star Fox Zero"),
+        _ => None,
     }
 }
 

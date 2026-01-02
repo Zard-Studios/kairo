@@ -127,29 +127,6 @@ impl KairoApp {
             status: Arc::new(Mutex::new(Status::Idle)),
         };
         
-        // Auto-load keys.txt if present in config dir
-        if let Some(proj_dirs) = ProjectDirs::from("com", "zardstudios", "kairo") {
-             let keys_path = proj_dirs.config_dir().join("keys.txt");
-             if keys_path.exists() {
-                 println!("Loading keys from: {:?}", keys_path);
-                 let _ = crate::disc_keys::load_keys_from_file(&keys_path);
-             }
-         }
-         
-         // Also check for "src/private_keys.store" (Dev Environment)
-         let dev_keys = std::path::Path::new("src/private_keys.store");
-         if dev_keys.exists() {
-             println!("Loading dev keys from: {:?}", dev_keys);
-             let _ = crate::disc_keys::load_keys_from_file(&dev_keys);
-         } else {
-             // Or maybe just "private_keys.store" in current dir
-             let local_keys = std::path::Path::new("private_keys.store");
-             if local_keys.exists() {
-                  println!("Loading local keys from: {:?}", local_keys);
-                  let _ = crate::disc_keys::load_keys_from_file(&local_keys);
-             }
-         }
-         
         app
     }
     
