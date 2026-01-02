@@ -163,7 +163,7 @@ pub fn lookup_disc_key_with_filename(product_code: &str, filename: Option<&str>)
     }
     
     // 2. Try to find a WUD key using filename
-    // Extract game name from filename (e.g., "Wii Party U [EUR].wud" -> "Wii Party U")
+    // Extract game name from filename (e.g., "Wii Party U (Europe).wud" -> "Wii Party U")
     if let Some(fname) = filename {
         // Remove extension and clean up
         let name = fname
@@ -172,19 +172,19 @@ pub fn lookup_disc_key_with_filename(product_code: &str, filename: Option<&str>)
             .trim_end_matches(".WUD")
             .trim_end_matches(".WUX");
         
-        // Remove region tags like [EUR], [USA], (EUR), etc.
-        let cleaned: String = name
-            .replace("[EUR]", "").replace("[USA]", "").replace("[JPN]", "")
-            .replace("(EUR)", "").replace("(USA)", "").replace("(JPN)", "")
-            .replace("[Europe]", "").replace("[USA]", "").replace("[Japan]", "")
-            .trim()
-            .to_string();
+        // Extract core game name: everything before first parenthesis
+        // "Wii Party U (Europe) (Rev 1)" -> "Wii Party U"
+        let core_name: &str = if let Some(paren_pos) = name.find('(') {
+            name[..paren_pos].trim()
+        } else {
+            name.trim()
+        };
         
-        if !cleaned.is_empty() {
+        if !core_name.is_empty() {
             let region = get_region(product_code);
-            let game_upper = cleaned.to_uppercase();
+            let game_upper = core_name.to_uppercase();
             
-            println!("   Searching for: '{}' [{}]", cleaned, region);
+            println!("   Searching for: '{}' [{}]", core_name, region);
             
             // First, try exact region match
             for (key_name, key_value) in db.iter() {
