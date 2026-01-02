@@ -17,6 +17,9 @@ const KEY_URLS: &[&str] = &[
     "https://titlekeys.ovh/json",
 ];
 
+// Myrient Redump has individual key files per game - we fetch on-demand
+const MYRIENT_BASE_URL: &str = "https://myrient.erista.me/files/Redump/Nintendo%20-%20Wii%20U%20-%20Disc%20Keys/";
+
 /// Database of known disc keys, indexed by product code (e.g., "ANXP")
 /// We use RwLock to allow updating it at runtime.
 static DISC_KEYS: LazyLock<RwLock<HashMap<String, String>>> = LazyLock::new(|| {
@@ -141,6 +144,90 @@ pub enum FetchError {
     Parse(String),
     NoKeysFound,
 }
+
+/// Fetch key directly from Myrient Redump for a specific game
+/// Returns the 16-byte key as hex string if found
+pub fn fetch_key_from_myrient(game_name: &str, region: &str) -> Option<String> {
+    // Myrient uses format: "Game Name (Region) (Languages).zip"
+    // We need to search the directory listing or try common patterns
+    
+    let region_name = match region {
+        "EUR" => "Europe",
+        "USA" => "USA",
+        "JPN" => "Japan",
+        _ => return None,
+    };
+    
+    // Try common filename patterns
+    let patterns = vec![
+        format!("{} ({}) ", game_name, region_name),
+        format!("{} ({})", game_name, region_name),
+    ];
+    
+    // Fetch directory listing
+    let client = match reqwest::blocking::Client::builder()
+        .user_agent("Kairo/0.1.0")
+        .build() {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+    
+    let listing_url = MYRIENT_BASE_URL;
+    let listing = match client.get(listing_url).send().and_then(|r| r.text()) {
+        Ok(t) => t,
+        Err(_) => return None,
+    };
+    
+    // Find matching filename in listing
+    for pattern in &patterns {
+        let pattern_upper = pattern.to_uppercase();
+        for line in listing.lines() {
+            if line.to_uppercase().contains(&pattern_upper) && line.contains(".zip") {
+                // Extract filename from href
+                if let Some(start) = line.find("href=\"") {
+                    let rest = &line[start + 6..];
+                    if let Some(end) = rest.find("\"") {
+                        let filename = &rest[..end];
+                        // Fetch the ZIP
+                        let zip_url = format!("{}{}", MYRIENT_BASE_URL, filename);
+                        println!("   Fetching key from Myrient: {}", filename);
+                        
+                        if let Ok(resp) = client.get(&zip_url).send() {
+                            if let Ok(bytes) = resp.bytes() {
+                                // ZIP contains a single .bin file with 16 bytes
+                                if let Ok(mut archive) = zip::ZipArchive::new(std::io::Cursor::new(bytes)) {
+                                    if let Ok(mut file) = archive.by_index(0) {
+                                        let mut key_bytes = vec![0u8; 16];
+                                        use std::io::Read;
+                                        if file.read_exact(&mut key_bytes).is_ok() {
+                                            let key_hex: String = key_bytes.iter()
+                                                .map(|b| format!("{:02x}", b))
+                                                .collect();
+                                            
+                                            println!("   Found key: {}", key_hex);
+                                            
+                                            // Store in DB for future lookups
+                                            if let Ok(mut db) = DISC_KEYS.write() {
+                                                db.insert(
+                                                    format!("WUD:{} [{}, WUD]", game_name.to_uppercase(), region),
+                                                    key_hex.clone()
+                                                );
+                                            }
+                                            
+                                            return Some(key_hex);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    None
+}
 /// Extract product code from WUD header
 pub fn extract_product_code(header: &[u8]) -> Option<String> {
     if header.len() < 10 { return None; }
@@ -204,8 +291,14 @@ pub fn lookup_disc_key_with_filename(product_code: &str, filename: Option<&str>)
                 }
             }
             
-            // If no exact region match, warn but don't use wrong region
-            println!("   ⚠️ No {} key found for this game in database.", region);
+            // Fallback: try Myrient Redump (has more complete regional keys)
+            println!("   Not found in Gist DB - trying Myrient Redump...");
+            drop(db); // Release read lock before network call
+            if let Some(key) = fetch_key_from_myrient(core_name, region) {
+                return Some(key);
+            }
+            
+            println!("   ⚠️ No {} key found for this game.", region);
         }
     }
     
