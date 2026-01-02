@@ -165,22 +165,27 @@ pub fn lookup_disc_key(product_code: &str) -> Option<String> {
     }
     
     // 2. Try to find a WUD key by game name
-    // First, get the game name from the product code
     if let Some(game_name) = get_game_name(product_code) {
         let region = get_region(product_code);
+        let game_upper = game_name.to_uppercase();
         
-        // Search for WUD keys matching this game name and region
-        let search_pattern = format!("WUD:{} [{}, WUD]", game_name.to_uppercase(), region);
-        
+        // First, try exact region match
         for (key_name, key_value) in db.iter() {
-            if key_name.contains(&search_pattern) {
-                return Some(key_value.clone());
-            }
-            // Also try partial match on game name
             if key_name.starts_with("WUD:") && 
-               key_name.to_uppercase().contains(&game_name.to_uppercase()) &&
+               key_name.to_uppercase().contains(&game_upper) &&
                key_name.contains(region) &&
                key_name.contains("WUD]") {
+                println!("   Matched via: {}", key_name);
+                return Some(key_value.clone());
+            }
+        }
+        
+        // Fallback: try ANY region for this game (WUD only)
+        for (key_name, key_value) in db.iter() {
+            if key_name.starts_with("WUD:") && 
+               key_name.to_uppercase().contains(&game_upper) &&
+               key_name.contains("WUD]") {
+                println!("   Matched (different region): {}", key_name);
                 return Some(key_value.clone());
             }
         }
