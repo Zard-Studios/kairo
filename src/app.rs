@@ -81,6 +81,7 @@ pub struct KairoApp {
     // Options
     operation: Operation,
     verify_hashes: bool,
+    export_wup: bool, // Export as WUP installable format
     
     // Key detection error message
     key_detect_error: Option<String>,
@@ -126,6 +127,7 @@ impl KairoApp {
             use_title_hex: !config.title_key_hex.is_empty(),
             operation: Operation::default(),
             verify_hashes: true,
+            export_wup: false, // Default to Cemu format
             key_detect_error: None,
             progress: Arc::new(Mutex::new(Progress::default())),
             status: Arc::new(Mutex::new(Status::Idle)),
@@ -648,6 +650,10 @@ impl eframe::App for KairoApp {
             
             if self.operation == Operation::ExtractToWup {
                 ui.checkbox(&mut self.verify_hashes, "Verify SHA-1 hashes");
+                ui.checkbox(&mut self.export_wup, "📦 Export as WUP (installable)");
+                if self.export_wup {
+                    ui.label("→ Output will be .app, .h3, title.tmd, title.tik");
+                }
             }
             
             ui.separator();
