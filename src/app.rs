@@ -82,6 +82,9 @@ pub struct KairoApp {
     operation: Operation,
     verify_hashes: bool,
     
+    // Key detection error message
+    key_detect_error: Option<String>,
+    
     // Progress
     progress: Arc<Mutex<Progress>>,
     status: Arc<Mutex<Status>>,
@@ -123,6 +126,7 @@ impl KairoApp {
             use_title_hex: !config.title_key_hex.is_empty(),
             operation: Operation::default(),
             verify_hashes: true,
+            key_detect_error: None,
             progress: Arc::new(Mutex::new(Progress::default())),
             status: Arc::new(Mutex::new(Status::Idle)),
         };
@@ -574,7 +578,29 @@ impl eframe::App for KairoApp {
                 if ui.button(if self.use_title_hex { "📄 File" } else { "🔢 Hex" }).clicked() {
                     self.use_title_hex = !self.use_title_hex;
                 }
+                
+                // Detect button
+                if ui.button("🔍 Detect").clicked() {
+                    if let Some(path) = &self.input_path.clone() {
+                        self.key_detect_error = None;
+                        let old_key = self.title_key_hex.clone();
+                        self.try_auto_lookup_key(path);
+                        // Check if key was found
+                        if self.title_key_hex == old_key || self.title_key_hex.is_empty() {
+                            self.key_detect_error = Some("No disc key found for this game. Try updating keys first.".to_string());
+                        } else {
+                            self.key_detect_error = None;
+                        }
+                    } else {
+                        self.key_detect_error = Some("Select a WUD file first".to_string());
+                    }
+                }
             });
+            
+            // Show detection error if any
+            if let Some(err) = &self.key_detect_error {
+                ui.colored_label(egui::Color32::RED, format!("⚠️ {}", err));
+            }
             
             ui.add_space(5.0);
             
