@@ -332,6 +332,7 @@ impl KairoApp {
         // Clone keys for the thread
         let common_key_hex = self.common_key_hex.clone();
         let title_key_hex = self.title_key_hex.clone();
+        let export_wup = self.export_wup; // Clone WUP export flag
         
         // Set running status and start time
         {
@@ -423,7 +424,36 @@ impl KairoApp {
                                 progress: Some(progress_cb),
                             };
                             
-                            crate::wup::extract_wud_to_wup(&options)
+                            // Extract to code/content/meta format
+                            let extract_result = crate::wup::extract_wud_to_wup(&options);
+                            
+                            // If WUP export is enabled, pack to installable format
+                            if export_wup && extract_result.is_ok() {
+                                println!("📦 Converting to WUP installable format...");
+                                
+                                // Create WUP output directory
+                                let wup_output = output.join("wup_installable");
+                                
+                                // Parse Title ID from the extracted content
+                                // For now, use a placeholder - TODO: parse from meta.xml
+                                let title_id: u64 = 0x0005000010000000;
+                                
+                                match crate::wup::pack_to_wup(
+                                    &output,
+                                    &wup_output,
+                                    &ck,
+                                    title_id,
+                                ) {
+                                    Ok(()) => {
+                                        println!("✅ WUP installable created at: {}", wup_output.display());
+                                    }
+                                    Err(e) => {
+                                        eprintln!("⚠️ WUP packing failed: {}", e);
+                                    }
+                                }
+                            }
+                            
+                            extract_result
                         }
                         _ => {
                             Err(crate::error::KairoError::InvalidKey(
