@@ -434,9 +434,12 @@ impl KairoApp {
                                 // Create WUP output directory
                                 let wup_output = output.join("wup_installable");
                                 
-                                // Parse Title ID from the extracted content
-                                // For now, use a placeholder - TODO: parse from meta.xml
-                                let title_id: u64 = 0x0005000010000000;
+                                // Parse Title ID from the extracted meta/meta.xml
+                                let title_id = crate::wup::pack::parse_title_id_from_meta(&output)
+                                    .unwrap_or_else(|| {
+                                        println!("   ⚠️ Using default Title ID");
+                                        0x0005000010000000
+                                    });
                                 
                                 match crate::wup::pack_to_wup(
                                     &output,

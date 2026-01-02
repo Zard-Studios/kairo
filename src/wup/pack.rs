@@ -297,6 +297,52 @@ pub fn sha256_hash(data: &[u8]) -> [u8; 32] {
 // Packing Functions
 //=============================================================================
 
+/// Parse Title ID from meta/meta.xml
+/// Returns the 64-bit Title ID (e.g., 0x0005000010101000)
+pub fn parse_title_id_from_meta(meta_dir: &Path) -> Option<u64> {
+    let meta_xml_path = meta_dir.join("meta").join("meta.xml");
+    
+    if !meta_xml_path.exists() {
+        println!("   ⚠️ meta.xml not found at: {}", meta_xml_path.display());
+        return None;
+    }
+    
+    let content = match fs::read_to_string(&meta_xml_path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("   ⚠️ Failed to read meta.xml: {}", e);
+            return None;
+        }
+    };
+    
+    // Look for <title_id type="hexBinary" length="8">XXXXXXXXXXXXXXXX</title_id>
+    // or <title_id>XXXXXXXXXXXXXXXX</title_id>
+    
+    // Simple regex-free parsing
+    if let Some(start) = content.find("<title_id") {
+        if let Some(rest) = content.get(start..) {
+            if let Some(gt) = rest.find('>') {
+                if let Some(end) = rest.find("</title_id>") {
+                    let id_str = &rest[gt+1..end].trim();
+                    // Parse hex string (may have 0x prefix or not)
+                    let hex_str = id_str.trim_start_matches("0x").trim_start_matches("0X");
+                    match u64::from_str_radix(hex_str, 16) {
+                        Ok(id) => {
+                            println!("   Found Title ID in meta.xml: {:016X}", id);
+                            return Some(id);
+                        }
+                        Err(_) => {
+                            println!("   ⚠️ Failed to parse title_id: {}", id_str);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    None
+}
+
 /// Content file info collected during enumeration
 pub struct ContentInfo {
     pub id: u32,
