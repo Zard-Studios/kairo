@@ -137,7 +137,7 @@ impl PartitionTable {
                 
                 eprintln!("Trying Partition Table Decryption with IV: {} ({:02X?})", name, &iv[..8]);
                 
-                for (i, raw) in raw_entries.iter().enumerate() {
+                for (_i, raw) in raw_entries.iter().enumerate() {
                     let mut entry = *raw;
                     crate::wud::decrypt::decrypt_buffer(&mut entry, common_key, &iv);
                     

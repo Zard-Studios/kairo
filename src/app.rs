@@ -87,17 +87,32 @@ pub struct KairoApp {
     status: Arc<Mutex<Status>>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Progress {
     pub percent: f32,
     pub message: String,
+    pub start_time: Option<std::time::Instant>,
+    pub files_extracted: usize,
+    pub total_files: usize,
+}
+
+impl Default for Progress {
+    fn default() -> Self {
+        Self {
+            percent: 0.0,
+            message: String::new(),
+            start_time: None,
+            files_extracted: 0,
+            total_files: 0,
+        }
+    }
 }
 
 impl KairoApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let config = AppConfig::load();
         
-        Self {
+        let app = Self {
             input_path: config.input_path,
             output_path: config.output_path,
             common_key_path: config.common_key_path,
@@ -110,7 +125,32 @@ impl KairoApp {
             verify_hashes: true,
             progress: Arc::new(Mutex::new(Progress::default())),
             status: Arc::new(Mutex::new(Status::Idle)),
-        }
+        };
+        
+        // Auto-load keys.txt if present in config dir
+        if let Some(proj_dirs) = ProjectDirs::from("com", "zardstudios", "kairo") {
+             let keys_path = proj_dirs.config_dir().join("keys.txt");
+             if keys_path.exists() {
+                 println!("Loading keys from: {:?}", keys_path);
+                 let _ = crate::disc_keys::load_keys_from_file(&keys_path);
+             }
+         }
+         
+         // Also check for "src/private_keys.store" (Dev Environment)
+         let dev_keys = std::path::Path::new("src/private_keys.store");
+         if dev_keys.exists() {
+             println!("Loading dev keys from: {:?}", dev_keys);
+             let _ = crate::disc_keys::load_keys_from_file(&dev_keys);
+         } else {
+             // Or maybe just "private_keys.store" in current dir
+             let local_keys = std::path::Path::new("private_keys.store");
+             if local_keys.exists() {
+                  println!("Loading local keys from: {:?}", local_keys);
+                  let _ = crate::disc_keys::load_keys_from_file(&local_keys);
+             }
+         }
+         
+        app
     }
     
     fn save_config(&self) {
@@ -224,50 +264,76 @@ impl KairoApp {
         None // All good!
     }
     
-    /// Try to automatically look up the disc key based on the WUD's product code
-    fn try_auto_lookup_key(&mut self, path: &std::path::Path) {
+    /// Try to automatically look up the disc key based on the WUD's product code or Title ID
+    fn try_auto_lookup_key(&mut self, path: &PathBuf) {
         use std::io::{Read, Seek, SeekFrom};
         
-        // Only for WUD files
-        let ext = path.extension()
-            .and_then(|e| e.to_str())
-            .map(|s| s.to_lowercase())
-            .unwrap_or_default();
-        
-        if ext != "wud" {
-            return;
-        }
-        
-        // Read first 64 bytes of the file to get product code
-        let Ok(mut file) = std::fs::File::open(path) else { return };
-        let mut header = [0u8; 64];
-        if file.read_exact(&mut header).is_err() {
-            return;
-        }
-        
-        // Extract product code
-        let Some(product_code) = crate::disc_keys::extract_product_code(&header) else { 
-            eprintln!("Could not extract product code from WUD header");
-            return;
-        };
-        
-        eprintln!("Detected product code: {}", product_code);
-        
-        // Look up the disc key
-        if let Some(key_hex) = crate::disc_keys::lookup_disc_key(&product_code) {
-            // Get game name for logging
-            let game_name = crate::disc_keys::get_game_name(&product_code).unwrap_or("Unknown Game");
-            let region = crate::disc_keys::get_region(&product_code);
-            
-            eprintln!("🔑 Auto-detected: {} [{}]", game_name, region);
-            eprintln!("   Disc Key: {}", key_hex);
-            
-            // Set the key automatically!
-            self.title_key_hex = key_hex.to_string();
-            self.use_title_hex = true;
-        } else {
-            eprintln!("⚠️ No disc key found for product code: {}", product_code);
-            eprintln!("   You'll need to provide the key manually.");
+        if let Ok(mut file) = std::fs::File::open(path) {
+            let mut buffer = vec![0u8; 65536]; // Read 64KB for deeper scan
+            // We use read (not read_exact) because file might be smaller than 64KB (unlikely for WUD but possible for test files)
+            if let Ok(bytes_read) = file.read(&mut buffer) {
+                let buffer = &buffer[..bytes_read];
+                // Try Product Code first
+                if let Some(code) = crate::disc_keys::extract_product_code(&buffer) {
+                    println!("Detected product code: {}", code);
+                    
+                    // Display info
+                    if let Some(name) = crate::disc_keys::get_game_name(&code) {
+                        let region = crate::disc_keys::get_region(&code);
+                         println!("🔑 Auto-detected: {} [{}]", name, region);
+                    }
+                    
+                    if let Some(key) = crate::disc_keys::lookup_disc_key(&code) {
+                        println!("   Found key in DB!");
+                        println!("   Disc Key: {}", key);
+                        self.title_key_hex = key;
+                        self.use_title_hex = true;
+                        self.title_key_path = None;
+                        return;
+                    }
+                    
+
+                }
+                
+                // Try Title ID (Heuristic - Check all candidates)
+                let candidates = crate::disc_keys::extract_title_candidates(&buffer);
+                let mut found_tid = false;
+                
+                if !candidates.is_empty() {
+                    println!("Detected Title ID candidates: {:?}", candidates);
+                    for tid in candidates {
+                        if let Some(key) = crate::disc_keys::lookup_by_title_id(&tid) {
+                            println!("   Found key in DB via Title ID: {}", tid);
+                            println!("   Disc Key: {}", key);
+                            
+                            self.title_key_hex = key;
+                            self.use_title_hex = true;
+                            self.title_key_path = None;
+                            
+                            // If we haven't detected name via product code, maybe we can? 
+                            // Current DB doesn't store names, but at least we have the key.
+                            found_tid = true;
+                            break;
+                        }
+                    }
+                    
+                    if !found_tid {
+                         println!("⚠️ No key found for any Title ID candidate.");
+                    }
+                } else {
+                    println!("⚠️ No Title ID candidates found in header.");
+                }
+                
+                if found_tid {
+                    return;
+                }
+                
+                // Try Product Code again just to show error if not found by either
+                 if let Some(code) = crate::disc_keys::extract_product_code(&buffer) {
+                    println!("⚠️ No disc key found for product code: {}", code);
+                    println!("   You'll need to provide the key manually.");
+                 }
+            }
         }
     }
     
@@ -282,11 +348,21 @@ impl KairoApp {
         let common_key_hex = self.common_key_hex.clone();
         let title_key_hex = self.title_key_hex.clone();
         
-        // Set running status
+        // Set running status and start time
         {
             let mut s = status.lock().unwrap();
             *s = Status::Running;
         }
+        {
+            let mut p = progress.lock().unwrap();
+            p.start_time = Some(std::time::Instant::now());
+            p.percent = 0.0;
+            p.message = "Starting...".to_string();
+            p.files_extracted = 0;
+            p.total_files = 0;
+        }
+        
+        let output_dir = output.clone();
         
         thread::spawn(move || {
             let result = match operation {
@@ -306,6 +382,14 @@ impl KairoApp {
                     match (input_file, output_file) {
                         (Ok(mut reader), Ok(mut writer)) => {
                             let progress_clone = Arc::clone(&progress);
+                            
+                            // Set start time if not set
+                            {
+                                let mut p = progress_clone.lock().unwrap();
+                                if p.start_time.is_none() {
+                                    p.start_time = Some(std::time::Instant::now());
+                                }
+                            }
                             
                             ::wux::decompress_with_progress(
                                 &mut reader,
@@ -339,6 +423,10 @@ impl KairoApp {
                                     let mut p = progress_clone.lock().unwrap();
                                     p.percent = percent;
                                     p.message = msg.to_string();
+                                    // Extract file count from message if possible
+                                    if msg.starts_with("Extracting:") {
+                                        p.files_extracted += 1;
+                                    }
                                 }
                             ));
                             
@@ -364,7 +452,28 @@ impl KairoApp {
             // Update status
             let mut s = status.lock().unwrap();
             *s = match result {
-                Ok(()) => Status::Success("Operation completed!".to_string()),
+                Ok(()) => {
+                    // Open output folder on success
+                    #[cfg(target_os = "macos")]
+                    {
+                        let _ = std::process::Command::new("open")
+                            .arg(&output_dir)
+                            .spawn();
+                    }
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _ = std::process::Command::new("explorer")
+                            .arg(&output_dir)
+                            .spawn();
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        let _ = std::process::Command::new("xdg-open")
+                            .arg(&output_dir)
+                            .spawn();
+                    }
+                    Status::Success("Operation completed!".to_string())
+                }
                 Err(e) => Status::Error(format!("{}", e)),
             };
         });
@@ -465,7 +574,7 @@ impl eframe::App for KairoApp {
             
             // Title key
             ui.horizontal(|ui| {
-                ui.label("Title:");
+                ui.label("Disc key:");
                 if self.use_title_hex {
                     if ui.add(egui::TextEdit::singleline(&mut self.title_key_hex)
                         .hint_text("32 hex chars")
@@ -490,6 +599,40 @@ impl eframe::App for KairoApp {
                 }
             });
             
+            ui.add_space(5.0);
+            
+            // Dynamic Key Fetching
+            ui.horizontal(|ui| {
+                if ui.button("⬇️ Update Keys from Web").clicked() {
+                     let status = Arc::clone(&self.status);
+                     let progress = Arc::clone(&self.progress);
+                     
+                     // Run in background to avoid freezing UI
+                     thread::spawn(move || {
+                         {
+                             let mut s = status.lock().unwrap();
+                             *s = Status::Running;
+                             let mut p = progress.lock().unwrap();
+                             p.message = "Fetching keys from web...".to_string();
+                             p.percent = 0.0;
+                         }
+                         
+                         match crate::disc_keys::update_keys() {
+                             Ok(count) => {
+                                 thread::sleep(std::time::Duration::from_millis(500)); // Show message briefly
+                                 let mut s = status.lock().unwrap();
+                                 *s = Status::Success(format!("Fetched {} new keys!", count));
+                             }
+                             Err(e) => {
+                                 let mut s = status.lock().unwrap();
+                                 *s = Status::Error(format!("Key update failed: {}", e));
+                             }
+                         }
+                     });
+                }
+                ui.label(egui::RichText::new("Fetches latest keys from community DBs").small().italics());
+            });
+            
             ui.separator();
             ui.label("⚙️ Operation");
             
@@ -510,9 +653,61 @@ impl eframe::App for KairoApp {
             
             match &status {
                 Status::Running => {
+                    // Calculate elapsed time
+                    let elapsed_str = if let Some(start) = progress.start_time {
+                        let elapsed = start.elapsed();
+                        let secs = elapsed.as_secs();
+                        let mins = secs / 60;
+                        let hours = mins / 60;
+                        if hours > 0 {
+                            format!("{:02}:{:02}:{:02}", hours, mins % 60, secs % 60)
+                        } else {
+                            format!("{:02}:{:02}", mins, secs % 60)
+                        }
+                    } else {
+                        "00:00".to_string()
+                    };
+                    
+                    // Calculate ETA
+                    let eta_str = if progress.percent > 0.01 {
+                        if let Some(start) = progress.start_time {
+                            let elapsed = start.elapsed().as_secs_f64();
+                            let total_estimated = elapsed / progress.percent as f64;
+                            let remaining = (total_estimated - elapsed).max(0.0) as u64;
+                            let mins = remaining / 60;
+                            let hours = mins / 60;
+                            if hours > 0 {
+                                format!("{:02}:{:02}:{:02}", hours, mins % 60, remaining % 60)
+                            } else {
+                                format!("{:02}:{:02}", mins, remaining % 60)
+                            }
+                        } else {
+                            "--:--".to_string()
+                        }
+                    } else {
+                        "--:--".to_string()
+                    };
+                    
+                    // Progress bar with percentage (no animation)
+                    let percent_text = format!("{:.1}%", progress.percent * 100.0);
                     ui.add(egui::ProgressBar::new(progress.percent)
-                        .text(&progress.message)
-                        .animate(true));
+                        .text(&percent_text));
+                    
+                    // Time info row
+                    ui.horizontal(|ui| {
+                        ui.label(format!("⏱ Elapsed: {}", elapsed_str));
+                        ui.separator();
+                        ui.label(format!("⏳ ETA: {}", eta_str));
+                        if progress.total_files > 0 {
+                            ui.separator();
+                            ui.label(format!("📁 {}/{} files", progress.files_extracted, progress.total_files));
+                        }
+                    });
+                    
+                    // Current operation message
+                    if !progress.message.is_empty() {
+                        ui.label(egui::RichText::new(&progress.message).color(egui::Color32::GRAY).small());
+                    }
                 }
                 Status::Success(msg) => {
                     ui.colored_label(egui::Color32::GREEN, format!("✅ {}", msg));

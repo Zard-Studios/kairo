@@ -99,7 +99,9 @@ pub fn decrypt_buffer(data: &mut [u8], key: &Key, iv: &[u8; 16]) {
 /// IV = 16-byte buffer with (file_offset >> 16) at position 0x08
 pub fn decrypt_chunk(data: &mut [u8], key: &Key, file_offset: u64) {
     let mut iv = [0u8; 16];
-    let iv_value = file_offset >> 16;
-    iv[8..16].copy_from_slice(&iv_value.to_be_bytes());
+    // WUD sectors are 0x8000 (2^15) bytes
+    // IV is the sector index (big endian)
+    let iv_value = file_offset >> 15;
+    iv[0..8].copy_from_slice(&iv_value.to_be_bytes());
     decrypt_buffer(data, key, &iv);
 }

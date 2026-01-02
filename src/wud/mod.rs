@@ -5,5 +5,5 @@
 mod partition;
 pub mod decrypt;
 
-pub use partition::{PartitionTable, Partition, PartitionType};
-pub use decrypt::decrypt_partition;
+// pub use partition::{PartitionTable, Partition, PartitionType};
+// pub use decrypt::decrypt_partition;

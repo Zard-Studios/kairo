@@ -6,4 +6,4 @@ mod header;
 mod decompress;
 
 pub use header::WuxHeader;
-pub use decompress::decompress_wux;
+// pub use decompress::decompress_wux;
