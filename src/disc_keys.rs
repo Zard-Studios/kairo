@@ -186,26 +186,26 @@ pub fn lookup_disc_key_with_filename(product_code: &str, filename: Option<&str>)
             
             println!("   Searching for: '{}' [{}]", core_name, region);
             
-            // First, try exact region match
+            // Only match with correct region - don't fallback to other regions (keys are region-specific!)
             for (key_name, key_value) in db.iter() {
                 if key_name.starts_with("WUD:") && 
                    key_name.to_uppercase().contains(&game_upper) &&
-                   key_name.contains(region) &&
                    key_name.contains("WUD]") {
-                    println!("   Matched: {}", key_name);
-                    return Some(key_value.clone());
+                    // Check if region matches
+                    let has_matching_region = 
+                        (region == "EUR" && key_name.contains("EUR,")) ||
+                        (region == "USA" && key_name.contains("USA,")) ||
+                        (region == "JPN" && key_name.contains("JPN,"));
+                    
+                    if has_matching_region {
+                        println!("   Matched: {}", key_name);
+                        return Some(key_value.clone());
+                    }
                 }
             }
             
-            // Fallback: try ANY region for this game (WUD only)
-            for (key_name, key_value) in db.iter() {
-                if key_name.starts_with("WUD:") && 
-                   key_name.to_uppercase().contains(&game_upper) &&
-                   key_name.contains("WUD]") {
-                    println!("   Matched (different region): {}", key_name);
-                    return Some(key_value.clone());
-                }
-            }
+            // If no exact region match, warn but don't use wrong region
+            println!("   ⚠️ No {} key found for this game in database.", region);
         }
     }
     
