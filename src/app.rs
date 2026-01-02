@@ -254,17 +254,20 @@ impl KairoApp {
             // We use read (not read_exact) because file might be smaller than 64KB (unlikely for WUD but possible for test files)
             if let Ok(bytes_read) = file.read(&mut buffer) {
                 let buffer = &buffer[..bytes_read];
+                
+                // Get filename for game name extraction
+                let filename = path.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string());
+                
                 // Try Product Code first
                 if let Some(code) = crate::disc_keys::extract_product_code(&buffer) {
                     println!("Detected product code: {}", code);
+                    let region = crate::disc_keys::get_region(&code);
+                    println!("   Region: {}", region);
                     
-                    // Display info
-                    if let Some(name) = crate::disc_keys::get_game_name(&code) {
-                        let region = crate::disc_keys::get_region(&code);
-                         println!("🔑 Auto-detected: {} [{}]", name, region);
-                    }
-                    
-                    if let Some(key) = crate::disc_keys::lookup_disc_key(&code) {
+                    // Try lookup with filename
+                    if let Some(key) = crate::disc_keys::lookup_disc_key_with_filename(&code, filename.as_deref()) {
                         println!("   Found key in DB!");
                         println!("   Disc Key: {}", key);
                         self.title_key_hex = key;
@@ -272,7 +275,6 @@ impl KairoApp {
                         self.title_key_path = None;
                         return;
                     }
-                    
 
                 }
                 

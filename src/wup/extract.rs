@@ -770,10 +770,9 @@ fn find_and_extract_fst<R: Read + Seek>(
             
             if let Some(known_key_hex) = crate::disc_keys::lookup_disc_key(&product_code) {
                 if let Some(known_key) = crate::disc_keys::parse_hex_key(&known_key_hex) {
-                    let game_name = crate::disc_keys::get_game_name(&product_code).unwrap_or("Unknown");
                     let region = crate::disc_keys::get_region(&product_code);
                     
-                    eprintln!("🔑 Trying known disc key for {} [{}]", game_name, region);
+                    eprintln!("🔑 Trying known disc key for {} [{}]", product_code, region);
                     eprintln!("   Key: {}", known_key_hex);
                     
                     if let Some(fst) = try_key(&known_key, "Database") {

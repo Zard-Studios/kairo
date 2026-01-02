@@ -152,11 +152,9 @@ pub fn extract_product_code(header: &[u8]) -> Option<String> {
 /// Extract Title ID from WUD header (if possible) or Ticket
 /// Note: WUD header at offset 0 usually contains Game Partition info?
 /// WUD common header:
-/// 0x00: "WUP-"
-/// Actually, Disc Header (at start of WUD) has Title ID?
-/// Usually we rely on Product Code "WUP-P-XXXX".
-/// But wait, Ticket has Title ID.
-pub fn lookup_disc_key(product_code: &str) -> Option<String> {
+/// Lookup disc key using product code and/or filename
+/// Game name is extracted from filename (no hardcoded names!)
+pub fn lookup_disc_key_with_filename(product_code: &str, filename: Option<&str>) -> Option<String> {
     let db = DISC_KEYS.read().unwrap();
     
     // 1. Direct lookup by product code
@@ -164,34 +162,59 @@ pub fn lookup_disc_key(product_code: &str) -> Option<String> {
         return Some(key.clone());
     }
     
-    // 2. Try to find a WUD key by game name
-    if let Some(game_name) = get_game_name(product_code) {
-        let region = get_region(product_code);
-        let game_upper = game_name.to_uppercase();
+    // 2. Try to find a WUD key using filename
+    // Extract game name from filename (e.g., "Wii Party U [EUR].wud" -> "Wii Party U")
+    if let Some(fname) = filename {
+        // Remove extension and clean up
+        let name = fname
+            .trim_end_matches(".wud")
+            .trim_end_matches(".wux")
+            .trim_end_matches(".WUD")
+            .trim_end_matches(".WUX");
         
-        // First, try exact region match
-        for (key_name, key_value) in db.iter() {
-            if key_name.starts_with("WUD:") && 
-               key_name.to_uppercase().contains(&game_upper) &&
-               key_name.contains(region) &&
-               key_name.contains("WUD]") {
-                println!("   Matched via: {}", key_name);
-                return Some(key_value.clone());
+        // Remove region tags like [EUR], [USA], (EUR), etc.
+        let cleaned: String = name
+            .replace("[EUR]", "").replace("[USA]", "").replace("[JPN]", "")
+            .replace("(EUR)", "").replace("(USA)", "").replace("(JPN)", "")
+            .replace("[Europe]", "").replace("[USA]", "").replace("[Japan]", "")
+            .trim()
+            .to_string();
+        
+        if !cleaned.is_empty() {
+            let region = get_region(product_code);
+            let game_upper = cleaned.to_uppercase();
+            
+            println!("   Searching for: '{}' [{}]", cleaned, region);
+            
+            // First, try exact region match
+            for (key_name, key_value) in db.iter() {
+                if key_name.starts_with("WUD:") && 
+                   key_name.to_uppercase().contains(&game_upper) &&
+                   key_name.contains(region) &&
+                   key_name.contains("WUD]") {
+                    println!("   Matched: {}", key_name);
+                    return Some(key_value.clone());
+                }
             }
-        }
-        
-        // Fallback: try ANY region for this game (WUD only)
-        for (key_name, key_value) in db.iter() {
-            if key_name.starts_with("WUD:") && 
-               key_name.to_uppercase().contains(&game_upper) &&
-               key_name.contains("WUD]") {
-                println!("   Matched (different region): {}", key_name);
-                return Some(key_value.clone());
+            
+            // Fallback: try ANY region for this game (WUD only)
+            for (key_name, key_value) in db.iter() {
+                if key_name.starts_with("WUD:") && 
+                   key_name.to_uppercase().contains(&game_upper) &&
+                   key_name.contains("WUD]") {
+                    println!("   Matched (different region): {}", key_name);
+                    return Some(key_value.clone());
+                }
             }
         }
     }
     
     None
+}
+
+/// Simple lookup by product code only (legacy)
+pub fn lookup_disc_key(product_code: &str) -> Option<String> {
+    lookup_disc_key_with_filename(product_code, None)
 }
 
 /// Load keys from a local text file (e.g. keys.txt)
@@ -267,34 +290,7 @@ pub fn extract_title_candidates(header: &[u8]) -> Vec<String> {
     candidates
 }
 
-/// Get game name from product code for WUD key lookup
-pub fn get_game_name(product_code: &str) -> Option<&'static str> {
-    match product_code {
-        "ANXP" | "ANXE" | "ANXJ" => Some("Wii Party U"),
-        "AMKP" | "AMKE" | "AMKJ" => Some("Mario Kart 8"),
-        "AXFP" | "AXFE" | "AXFJ" => Some("Super Smash Bros."),
-        "ARDP" | "ARDE" | "ARDJ" => Some("Super Mario 3D World"),
-        "ALZP" | "ALZE" | "ALZJ" => Some("The Legend of Zelda: Breath of the Wild"),
-        "AGMP" | "AGME" | "AGMJ" => Some("Splatoon"),
-        "ARPP" | "ARPE" | "ARPJ" => Some("New Super Mario Bros. U"),
-        "ALSP" | "ALSE" | "ALSJ" => Some("New Super Luigi U"),
-        "AKBP" | "AKBE" | "AKBJ" => Some("Pikmin 3"),
-        "AWSP" | "AWSE" | "AWSJ" => Some("Super Mario Maker"),
-        "ASAP" | "ASAE" | "ASAJ" => Some("Xenoblade Chronicles X"),
-        "ACDP" | "ACDE" | "ACDJ" => Some("Hyrule Warriors"),
-        "AAAP" | "AAAE" | "AAAJ" => Some("Bayonetta 2"),
-        "AKTP" | "AKTE" | "AKTJ" => Some("Captain Toad: Treasure Tracker"),
-        "AY9P" | "AY9E" | "AY9J" => Some("Yoshi's Woolly World"),
-        "ADNP" | "ADNE" | "ADNJ" => Some("Donkey Kong Country: Tropical Freeze"),
-        "ATWP" | "ATWE" | "ATWJ" => Some("The Wonderful 101"),
-        "AMSP" | "AMSE" | "AMSJ" => Some("Tokyo Mirage Sessions #FE"),
-        "BWPP" | "BWPE" | "BWPJ" => Some("Paper Mario: Color Splash"),
-        "AKEP" | "AKEE" | "AKEJ" => Some("Star Fox Zero"),
-        _ => None,
-    }
-}
-
-/// Get region
+/// Get region from product code (last character)
 pub fn get_region(product_code: &str) -> &'static str {
     match product_code.chars().last() {
         Some('P') => "EUR",
