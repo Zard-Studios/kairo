@@ -421,7 +421,7 @@ impl KairoApp {
                                 output_dir: &output,
                                 common_key: &ck,
                                 title_key: &tk,
-                                progress: Some(progress_cb),
+                                progress: Some(progress_cb.clone()),
                             };
                             
                             // Extract to code/content/meta format
@@ -446,6 +446,7 @@ impl KairoApp {
                                     &wup_output,
                                     &ck,
                                     title_id,
+                                    Some(progress_cb.clone()), // Pass progress callback
                                 ) {
                                     Ok(()) => {
                                         println!("✅ WUP installable created at: {}", wup_output.display());

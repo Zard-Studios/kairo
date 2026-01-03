@@ -178,6 +178,7 @@ impl Default for TicketHeader {
 }
 
 //=============================================================================
+//=============================================================================
 // Encryption Functions
 //=============================================================================
 
@@ -227,75 +228,199 @@ pub fn encrypt_title_key(
     result
 }
 
-/// Encrypt content data using AES-128-CBC
-/// IV is content index as big-endian u16 padded with zeros
-pub fn encrypt_content(
-    data: &[u8],
-    title_key: &[u8; 16],
+// Streaming Encryption & Hashing
+//=============================================================================
+
+/// Progress callback type (matches extract.rs)
+pub type ProgressCallback = std::sync::Arc<std::sync::Mutex<dyn Fn(f32, &str) + Send>>;
+
+/// Process a folder, packing its contents into an .app file using streaming encryption.
+/// Returns (size, sha256_hash, sha1_hashes_for_h3)
+fn pack_folder_streaming(
+    folder_path: &Path, 
+    app_path: &Path, 
+    title_key: &[u8; 16], 
     content_index: u16,
-) -> Vec<u8> {
-    let cipher = Aes128::new(GenericArray::from_slice(title_key));
+    progress: Option<&ProgressCallback>
+) -> Result<(u64, [u8; 32], Vec<u8>), String> {
     
-    // Pad data to 16-byte boundary
-    let padded_len = (data.len() + 15) & !15;
-    let mut padded = vec![0u8; padded_len];
-    padded[..data.len()].copy_from_slice(data);
+    // 1. Prepare output file
+    let mut app_file = File::create(app_path).map_err(|e| format!("Failed to create .app file: {}", e))?;
     
+    // 2. Initialize encryption (AES-128-CBC)
     // IV = content index (big endian) + 14 zero bytes
     let mut iv = [0u8; 16];
     iv[0..2].copy_from_slice(&content_index.to_be_bytes());
+    let cipher = Aes128::new(GenericArray::from_slice(title_key));
+    let mut prev_block = iv; // CBC chaining state
     
-    // Encrypt in CBC mode
-    let mut result = Vec::with_capacity(padded_len);
-    let mut prev_block = iv;
+    // 3. Initialize hashing
+    let mut sha256 = sha2::Sha256::new(); // Hash of PLAINTEXT data (decrypted)
+    let mut current_h3_block = Vec::with_capacity(HASH_BLOCK_SIZE);
+    let mut h3_hashes = Vec::new();
     
-    for chunk in padded.chunks(16) {
-        // XOR with previous block
-        let mut block = [0u8; 16];
-        for i in 0..16 {
-            block[i] = chunk[i] ^ prev_block[i];
+    // 4. Collect file list recursively to ensure deterministic order
+    let mut file_entries = Vec::new();
+    collect_files_recursive(folder_path, folder_path, &mut file_entries)?;
+    
+    // Calculate total size for progress (approximate)
+    let total_bytes: u64 = file_entries.iter()
+        .map(|(name, size)| 12 + name.len() as u64 + *size)
+        .sum();
+    let mut processed_bytes = 0u64;
+    
+    // We need a buffering mechanism because we can only encrypt full 16-byte blocks
+    let mut encryption_buffer = Vec::with_capacity(CONTENT_BLOCK_SIZE);
+    
+    for (rel_path, size) in file_entries {
+        // File Header: Name Len (4) + Name + Data Len (8)
+        let name_bytes = rel_path.as_bytes();
+        let name_len = name_bytes.len() as u32;
+        let data_len = size;
+        
+        let mut header = Vec::new();
+        header.extend_from_slice(&name_len.to_be_bytes());
+        header.extend_from_slice(name_bytes);
+        header.extend_from_slice(&data_len.to_be_bytes());
+        
+        // Process header
+        process_chunk(
+            &header, &mut encryption_buffer, &cipher, &mut prev_block, 
+            &mut app_file, &mut sha256, &mut current_h3_block, &mut h3_hashes
+        )?;
+        
+        // Process file content streaming
+        let mut file = File::open(folder_path.join(&rel_path)).map_err(|e| e.to_string())?;
+        let mut buffer = [0u8; 64 * 1024]; // 64KB buffer
+        
+        loop {
+            let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
+            if n == 0 { break; }
+            
+            process_chunk(
+                &buffer[..n], &mut encryption_buffer, &cipher, &mut prev_block, 
+                &mut app_file, &mut sha256, &mut current_h3_block, &mut h3_hashes
+            )?;
+            
+            processed_bytes += n as u64;
+            if let Some(cb) = progress {
+                if processed_bytes % (1024 * 1024 * 10) == 0 { // Update every 10MB
+                    let pct = (processed_bytes as f32 / total_bytes as f32) * 100.0;
+                    (cb.lock().unwrap())(pct, &format!("Packing {:08X}.app: {}", content_index, rel_path));
+                }
+            }
         }
-        
-        // Encrypt
-        let mut encrypted = GenericArray::clone_from_slice(&block);
-        cipher.encrypt_block(&mut encrypted);
-        
-        result.extend_from_slice(&encrypted);
-        prev_block.copy_from_slice(&encrypted);
     }
     
-    result
-}
-
-/// Generate H3 hash file (SHA-1 hash tree)
-/// H3 contains hashes of 4MB blocks
-pub fn generate_h3_hashes(encrypted_data: &[u8]) -> Vec<u8> {
-    let mut hashes = Vec::new();
+    // Final Padding to 16-byte boundary
+    let padding_needed = (16 - (encryption_buffer.len() % 16)) % 16;
+    if padding_needed > 0 {
+        let padding = vec![0u8; padding_needed];
+        process_chunk(
+            &padding, &mut encryption_buffer, &cipher, &mut prev_block,
+            &mut app_file, &mut sha256, &mut current_h3_block, &mut h3_hashes
+        )?;
+    }
     
-    for chunk in encrypted_data.chunks(HASH_BLOCK_SIZE) {
+    // Flush remaining buffer
+    if !encryption_buffer.is_empty() {
+         encrypt_buffer_inplace(&mut encryption_buffer, &cipher, &mut prev_block);
+         app_file.write_all(&encryption_buffer).map_err(|e| e.to_string())?;
+         
+         // Update H3 with remaining encrypted data
+         current_h3_block.extend_from_slice(&encryption_buffer);
+         while current_h3_block.len() >= HASH_BLOCK_SIZE {
+             let chunk: Vec<u8> = current_h3_block.drain(0..HASH_BLOCK_SIZE).collect();
+             let mut hasher = Sha1::new();
+             hasher.update(&chunk);
+             h3_hashes.extend_from_slice(&hasher.finalize());
+         }
+    }
+    
+    // Final H3 hash for partial block
+    if !current_h3_block.is_empty() {
         let mut hasher = Sha1::new();
-        hasher.update(chunk);
-        let hash = hasher.finalize();
-        hashes.extend_from_slice(&hash);
+        hasher.update(&current_h3_block);
+        h3_hashes.extend_from_slice(&hasher.finalize());
     }
     
-    hashes
+    let final_sha256 = sha256.finalize();
+    let mut hash_arr = [0u8; 32];
+    hash_arr.copy_from_slice(&final_sha256);
+    
+    let final_size = app_file.metadata().map_err(|e| e.to_string())?.len();
+    
+    Ok((final_size, hash_arr, h3_hashes))
 }
 
-/// Calculate SHA-256 hash of data
-pub fn sha256_hash(data: &[u8]) -> [u8; 32] {
-    use sha2::{Sha256, Digest as Sha2Digest};
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&result);
-    hash
+fn collect_files_recursive(dir: &Path, base: &Path, entries: &mut Vec<(String, u64)>) -> Result<(), String> {
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_file() {
+            let relative = path.strip_prefix(base).unwrap().to_string_lossy().to_string();
+            let size = path.metadata().map_err(|e| e.to_string())?.len();
+            entries.push((relative, size));
+        } else if path.is_dir() {
+            collect_files_recursive(&path, base, entries)?;
+        }
+    }
+    Ok(())
 }
 
-//=============================================================================
-// Packing Functions
-//=============================================================================
+fn process_chunk(
+    data: &[u8],
+    buffer: &mut Vec<u8>,
+    cipher: &Aes128,
+    prev_block: &mut [u8; 16],
+    writer: &mut File,
+    sha256: &mut sha2::Sha256,
+    h3_buffer: &mut Vec<u8>,
+    h3_hashes: &mut Vec<u8>
+) -> Result<(), String> {
+    sha256.update(data);
+    buffer.extend_from_slice(data);
+    
+    // Encrypt full 16-byte blocks
+    while buffer.len() >= 16 {
+        // Take 16 bytes, but wait... we might have exactly 16 bytes and this might be the end.
+        // Actually, padding is handled at the very end of pack_folder_streaming. 
+        // So here we process as many full blocks as possible.
+        // Wait, efficient way: find split point
+        let split_idx = (buffer.len() / 16) * 16;
+        if split_idx == 0 { break; }
+        
+        let mut chunk: Vec<u8> = buffer.drain(0..split_idx).collect();
+        encrypt_buffer_inplace(&mut chunk, cipher, prev_block);
+        
+        writer.write_all(&chunk).map_err(|e| e.to_string())?;
+        
+        // H3 processing
+        h3_buffer.extend_from_slice(&chunk);
+        while h3_buffer.len() >= HASH_BLOCK_SIZE {
+             let h3_chunk: Vec<u8> = h3_buffer.drain(0..HASH_BLOCK_SIZE).collect();
+             let mut hasher = Sha1::new();
+             hasher.update(&h3_chunk);
+             h3_hashes.extend_from_slice(&hasher.finalize());
+        }
+    }
+    Ok(())
+}
+
+fn encrypt_buffer_inplace(buffer: &mut [u8], cipher: &Aes128, prev_block: &mut [u8; 16]) {
+    for chunk in buffer.chunks_mut(16) {
+        // XOR with previous
+        for i in 0..16 {
+            chunk[i] ^= prev_block[i];
+        }
+        // Encrypt
+        let mut block = GenericArray::clone_from_slice(chunk);
+        cipher.encrypt_block(&mut block);
+        
+        chunk.copy_from_slice(&block);
+        prev_block.copy_from_slice(&block);
+    }
+}
 
 /// Parse Title ID from meta/meta.xml
 /// Returns the 64-bit Title ID (e.g., 0x0005000010101000)
@@ -351,112 +476,64 @@ pub struct ContentInfo {
     pub hash: [u8; 32],
 }
 
-/// Pack code/content/meta folders into WUP installable format
 pub fn pack_to_wup(
     input_dir: &Path,
     output_dir: &Path,
     common_key: &[u8; 16],
     title_id: u64,
+    progress: Option<ProgressCallback>
 ) -> Result<(), String> {
-    println!("📦 Starting WUP packing...");
-    println!("   Input:  {}", input_dir.display());
-    println!("   Output: {}", output_dir.display());
-    println!("   Title ID: {:016X}", title_id);
+    println!("📦 Starting WUP packing (Streaming Mode)...");
     
-    // Create output directory
     fs::create_dir_all(output_dir).map_err(|e| format!("Failed to create output dir: {}", e))?;
     
-    // Generate random title key
     let title_key = generate_title_key();
-    println!("   Generated title key: {}", hex::encode(&title_key));
-    
-    // Enumerate content (we combine code+content+meta into .app files)
     let mut contents: Vec<ContentInfo> = Vec::new();
     let mut content_id = 0u32;
     
-    // Process each folder as a content entry
     for folder in &["code", "content", "meta"] {
         let folder_path = input_dir.join(folder);
         if folder_path.exists() {
-            // Create a single .app file for each folder
             let app_path = output_dir.join(format!("{:08X}.app", content_id));
-            
-            // Pack folder contents (simplified: just concatenate files with header)
-            let packed_data = pack_folder(&folder_path)?;
-            let hash = sha256_hash(&packed_data);
-            
-            // Encrypt and write
-            let encrypted = encrypt_content(&packed_data, &title_key, content_id as u16);
-            fs::write(&app_path, &encrypted).map_err(|e| format!("Failed to write .app: {}", e))?;
-            
-            // Generate H3
-            let h3_data = generate_h3_hashes(&encrypted);
             let h3_path = output_dir.join(format!("{:08X}.h3", content_id));
-            fs::write(&h3_path, &h3_data).map_err(|e| format!("Failed to write .h3: {}", e))?;
             
-            println!("   Created {:08X}.app ({} bytes)", content_id, encrypted.len());
+            if let Some(cb) = &progress {
+                (cb.lock().unwrap())(0.0, &format!("Packing {}...", folder));
+            }
+
+            let (size, hash, h3_hashes) = pack_folder_streaming(
+                &folder_path, &app_path, &title_key, content_id as u16, progress.as_ref()
+            )?;
+            
+            fs::write(&h3_path, &h3_hashes).map_err(|e| format!("Failed to write .h3: {}", e))?;
             
             contents.push(ContentInfo {
                 id: content_id,
                 path: app_path,
-                size: packed_data.len() as u64,
+                size,
                 hash,
             });
-            
             content_id += 1;
         }
     }
     
     if contents.is_empty() {
-        return Err("No content folders found (code/content/meta)".to_string());
+        return Err("No content folders found".to_string());
     }
     
-    // Generate TMD
-    generate_tmd(output_dir, title_id, &contents)?;
+    if let Some(cb) = &progress {
+        (cb.lock().unwrap())(1.0, "Generating Metadata...");
+    }
     
-    // Generate Ticket
+    generate_tmd(output_dir, title_id, &contents)?;
     generate_ticket(output_dir, title_id, &title_key, common_key)?;
     
-    // Generate certificate (empty/placeholder for homebrew)
     let cert_path = output_dir.join("title.cert");
     fs::write(&cert_path, &[]).map_err(|e| format!("Failed to write cert: {}", e))?;
     
     println!("✅ WUP packing complete!");
     Ok(())
 }
-
-/// Pack a folder's contents into a byte array
-fn pack_folder(folder: &Path) -> Result<Vec<u8>, String> {
-    let mut data = Vec::new();
-    
-    fn pack_recursive(dir: &Path, base: &Path, data: &mut Vec<u8>) -> Result<(), String> {
-        for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path();
-            
-            if path.is_file() {
-                let relative = path.strip_prefix(base).unwrap();
-                let name = relative.to_string_lossy();
-                
-                // Write file entry: name length (4 bytes) + name + data length (8 bytes) + data
-                let name_bytes = name.as_bytes();
-                data.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
-                data.extend_from_slice(name_bytes);
-                
-                let mut file_data = fs::read(&path).map_err(|e| e.to_string())?;
-                data.extend_from_slice(&(file_data.len() as u64).to_be_bytes());
-                data.append(&mut file_data);
-            } else if path.is_dir() {
-                pack_recursive(&path, base, data)?;
-            }
-        }
-        Ok(())
-    }
-    
-    pack_recursive(folder, folder, &mut data)?;
-    Ok(data)
-}
-
 /// Generate title.tmd file
 fn generate_tmd(output_dir: &Path, title_id: u64, contents: &[ContentInfo]) -> Result<(), String> {
     let mut tmd_data = Vec::new();
@@ -464,7 +541,7 @@ fn generate_tmd(output_dir: &Path, title_id: u64, contents: &[ContentInfo]) -> R
     // TMD Header
     let mut header = TmdHeader::default();
     header.signature_type = TMD_SIGNATURE_TYPE.to_be();
-    header.issuer[..8].copy_from_slice(b"Root-CA");
+    header.issuer[..8].copy_from_slice(b"Root-CA\0");
     header.version = 1;
     header.title_id = title_id.to_be();
     header.title_type = 0x00050000u32.to_be(); // Game
@@ -520,7 +597,7 @@ fn generate_ticket(
     let mut ticket = TicketHeader::default();
     
     // Set issuer
-    ticket.issuer[..8].copy_from_slice(b"Root-CA");
+    ticket.issuer[..8].copy_from_slice(b"Root-CA\0");
     
     // Encrypt title key with common key
     let encrypted_key = encrypt_title_key(title_key, common_key, title_id);
